@@ -1,0 +1,30 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.egg-info/
+.env
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & Models (если нужно)
+data/
+*.pth
+*.pt
+*.onnx
+
+# Node (если нужно)
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
