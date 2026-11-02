@@ -1,0 +1,47 @@
+import numpy as np
+from camera import Camera
+
+def pixel_to_ray(camera: Camera, u: float, v:float) -> np.ndarray:
+     
+    pixel = np.array([u, v, 1.0])
+    
+    # Пиксель -> координаты камеры
+    direction_camera = np.linalg.inv(camera.K) @ pixel
+    
+    # Координаты камеры -> мировые координаты
+    direction_word = camera.R.T @ direction_camera
+    
+    # нормализация
+    direction_word /= np.linalg.norm(direction_camera)
+    
+    return direction_camera
+
+
+def triangulate(cameras: list[Camera], detections: list[tuple[float, float]]) -> np.ndarray:
+    if len(cameras) != len(detections):
+        raise ValueError("Количество камер и детекций не совпадает")
+    
+    if len(cameras) < 2:
+        raise ValueError("Для трингуляции нужны минимум 2 камеры")
+    
+    A_total = np.zeros((3, 3))
+    b_total = np.zeros(3)    
+    I = np.eye(3)
+    
+    for camera, (u, v) in zip(cameras, detections):
+        
+        # Центр камеры
+        C = camera.position
+        
+        # Направление луча
+        d = pixel_to_ray(camera, u, v)
+        
+        # Матрица проекции на плоскость, перпендикулярную лучу
+        A = I - np.outer(d, d)
+        
+        A_total += A
+        b_total += A @ C
+        
+        point_3D = np.linalg.solve(A_total, b_total)
+        
+        return point_3D
