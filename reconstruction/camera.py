@@ -74,4 +74,7 @@ class Camera:
         ])
         
         
-        
+cam_1 = Camera(position_cam_1, azimuth_rad_cam_1, f_x, f_y, c_x, c_y, width, height)  
+cam_2 = Camera(position_cam_2, azimuth_rad_cam_2, f_x, f_y, c_x, c_y, width, height)  
+cam_3 = Camera(position_cam_3, azimuth_rad_cam_3, f_x, f_y, c_x, c_y, width, height)  
+

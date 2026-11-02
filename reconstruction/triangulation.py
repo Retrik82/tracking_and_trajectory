@@ -45,3 +45,23 @@ def triangulate(cameras: list[Camera], detections: list[tuple[float, float]]) ->
         point_3D = np.linalg.solve(A_total, b_total)
         
         return point_3D
+    
+    
+def calculate_ray_error(point_3d: np.ndarray, cameras: list[Camera], detections: list[tuple[float, float]],) -> float:
+
+    errors = []
+
+    for camera, (u, v) in zip(cameras, detections):
+
+        direction = pixel_to_ray(camera, u, v)
+
+        distance = np.linalg.norm(
+            np.cross(
+                point_3d - camera.position,
+                direction,
+            )
+        )
+
+        errors.append(distance)
+
+    return float(np.mean(errors))
