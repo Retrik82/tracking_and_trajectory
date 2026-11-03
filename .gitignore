@@ -30,3 +30,4 @@ dist/
 Thumbs.db
 # Локальные данные (видео, CSV, архивы) — не коммитим
 tmp/
+.pytest_cache/
