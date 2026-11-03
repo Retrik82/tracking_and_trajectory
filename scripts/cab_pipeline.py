@@ -28,6 +28,7 @@ import numpy as np
 
 from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
 from reconstruction.cab_model import (
+    truck_axes,
     CAB_CENTER_BACK,
     CAB_CENTER_UP,
     DEFAULT_DIMENSIONS,
@@ -41,6 +42,7 @@ from reconstruction.cab_model import (
 from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera, video_path
 from reconstruction.objective import ObjectiveData
 from reconstruction.optimizer import optimize_trajectory
+from reconstruction.truck_model import SCENE_SCALE, TruckModel
 from reconstruction.visibility import INITIALIZING, MEASURED, PARTIAL, PREDICTED, TrackerSettings, run_tracker
 from scripts.yolo_analysis import (
     AQUA, BLUE, INK_2, MAGENTA, MUTED, ORANGE, YELLOW, CAMERA_COLORS, CAMERAS, NUM_VIDEO_FRAMES,
@@ -80,6 +82,9 @@ def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                    help="центр кабины: насколько назад от передней грани, ед. мира (допущение, см. cab_model)")
     g.add_argument("--cab-center-up", type=float, default=CAB_CENTER_UP,
                    help="центр кабины: насколько выше низа передней грани, ед. мира")
+    g.add_argument("--truck-fbx", type=Path, default=Path("models/CargoTruck.fbx"),
+                   help="3D-модель грузовика для трекера реального времени; если файла нет — коробка")
+    g.add_argument("--truck-scale", type=float, default=SCENE_SCALE, help="масштаб актора грузовика в сцене")
     return p
 
 
@@ -162,6 +167,14 @@ def step_realtime(args, detections) -> dict:
     settings = TrackerSettings(fps=args.fps, units_per_meter=args.units_per_meter,
                                cab_center_back=args.cab_center_back, cab_center_up=args.cab_center_up)
     dims = TruckDimensions(args.truck_length, args.truck_width, args.truck_height)
+    model = None
+    if args.truck_fbx and Path(args.truck_fbx).exists():
+        model = TruckModel.from_fbx(args.truck_fbx, scale=args.truck_scale)
+        log.info("трекер: 3D-модель %s, масштаб %.3f, габариты %s м", args.truck_fbx, args.truck_scale,
+                 np.round(model.dimensions / args.units_per_meter, 2))
+        METHOD_NAMES["realtime_ref"] = "Реальное время: точка CSV цели на модели"
+    else:
+        log.warning("трекер: 3D-модели %s нет, используется коробка %s", args.truck_fbx, dims)
     cache: dict = {}
 
     def provider(cam, frame):
@@ -170,7 +183,7 @@ def step_realtime(args, detections) -> dict:
         return cache[(cam, frame)]
 
     started = time.time()
-    result = run_tracker(observations, provider, np.arange(NUM_VIDEO_FRAMES), points, reliable, settings, dims)
+    result = run_tracker(observations, provider, np.arange(NUM_VIDEO_FRAMES), points, reliable, settings, dims, model)
     elapsed = time.time() - started
     status = result.array("status")
     log.info("реальное время: %.1f мс/кадр (с чтением поз камер); статусы %s", elapsed / NUM_VIDEO_FRAMES * 1000,
@@ -182,7 +195,7 @@ def step_realtime(args, detections) -> dict:
              cameras=result.array("cameras"), cameras_used=result.array("cameras_used"),
              occluded_edges=result.array("occluded_edges"),
              frames_since_measurement=result.array("frames_since_measurement"))
-    return {"result": result, "dimensions": dims, "ms_per_frame": elapsed / NUM_VIDEO_FRAMES * 1000}
+    return {"result": result, "dimensions": dims, "model": model, "ms_per_frame": elapsed / NUM_VIDEO_FRAMES * 1000}
 
 
 # ---------------------------------------------------------------- сравнение
@@ -424,7 +437,10 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
               "- Курс берётся из направления скорости фильтра. В медленном резком повороте (кадры ~650–850, "
               "~5–6 м/с) он ошибается на десятки градусов, и точка кабины уходит вбок примерно на половину длины.",
               "- Участок, где грузовик видит одна камера (кадры ~200–300), даёт большую ошибку по глубине.",
-              "- Габариты коробки фиксированы (по умолчанию 16.5 × 2.55 × 4.0 м): онлайн-уточнение расходится.",
+              "- С 3D-моделью: масштаб актора ×3.186 подтверждается и без CSV цели (лучшее совпадение с рамками YOLO "
+              "при ×3.0–3.19), а положение точки CSV на модели (передний край кабины, 3 м над дорогой) "
+              "откалибровано по CSV цели — сверьте с актором в Unreal.",
+              "- Без 3D-модели — коробка 16.5 × 2.55 × 4.0 м (онлайн-уточнение габаритов расходится).",
               "- Пределы ускорения и СКО ребра рамки подобраны под эту сцену (по CSV цели)."]
     (args.out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -448,8 +464,11 @@ def render_videos(args, detections, c: dict) -> None:
     heading = track.array("heading")
     span = np.all(np.isfinite(ref), axis=1)
     direction = np.c_[np.cos(heading), np.sin(heading), np.zeros(len(heading))]
+    model = c["realtime"]["model"]
+    centers = track.array("box_center")
     corners = np.full((NUM_VIDEO_FRAMES, 8, 3), np.nan)
-    corners[span] = box_corners(ref[span], direction[span], dims)
+    if model is None:
+        corners[span] = box_corners(ref[span], direction[span], dims)
     speed = c["series"][MAIN_METHOD]["speed"]
     err = c["series"][MAIN_METHOD]["error"]
     upm = args.units_per_meter
@@ -473,11 +492,18 @@ def render_videos(args, detections, c: dict) -> None:
             d = detections[cam].get(f)
             if d is not None:
                 cv2.rectangle(img, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), bgr(MUTED), 1, cv2.LINE_AA)
-            if span[f]:
+            if span[f] and model is not None:
+                fw, sd, up = (a[0] for a in truck_axes(direction[f][None, :]))
+                hull = camera.project(model.to_world(centers[f], fw, sd, up, model.hull))
+                hull = hull[np.all(np.isfinite(hull), axis=1)].astype(np.int32)
+                if len(hull) > 2:
+                    cv2.polylines(img, [cv2.convexHull(hull)], True, bgr(BLUE), 2, cv2.LINE_AA)
+            elif span[f]:
                 box = camera.project(corners[f])
                 for a, b in _BOX_EDGES:
                     if np.all(np.isfinite(box[[a, b]])):
                         cv2.line(img, tuple(box[a].astype(int)), tuple(box[b].astype(int)), bgr(BLUE), 2, cv2.LINE_AA)
+            if span[f]:
                 trail = camera.project(pts[max(0, f - 90):f + 1])
                 trail = trail[np.all(np.isfinite(trail), axis=1)].astype(np.int32)
                 if len(trail) > 1:
@@ -507,7 +533,7 @@ def render_videos(args, detections, c: dict) -> None:
             for i, text in enumerate(lines):
                 color = bgr(ORANGE) if text.startswith(("PREDICTED", "PARTIAL")) else (255, 255, 255)
                 cv2.putText(img, text, (20, 38 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-            legend = [("truck box (tracker)", BLUE), ("cab center + past trail", YELLOW), ("detector box", MUTED),
+            legend = [("truck model (tracker)" if model is not None else "truck box (tracker)", BLUE), ("cab center + past trail", YELLOW), ("detector box", MUTED),
                       ("target CSV", AQUA)]
             for i, (text, col) in enumerate(legend):
                 y = IMAGE_HEIGHT - 20 - 26 * (len(legend) - 1 - i)

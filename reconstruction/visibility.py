@@ -47,6 +47,7 @@ from reconstruction.cab_model import (
 from reconstruction.camera import Camera
 from reconstruction.objective import CameraProvider, ObservationGeometry
 from reconstruction.triangulation import triangulate_robust
+from reconstruction.truck_model import TruckModel
 
 MEASURED, PARTIAL, PREDICTED, INITIALIZING = "measured", "partial", "predicted", "initializing"
 STATE_SIZE = 6     # x, y, z, vx, vy, vz (единицы мира и единицы мира за кадр)
@@ -143,7 +144,7 @@ def detect_occluded_edges(predicted: np.ndarray, observed: np.ndarray, edge_vali
 class FrameEstimate:
     frame: int
     status: str
-    position: np.ndarray                  # опорная точка (низ передней грани по центру)
+    position: np.ndarray                  # точка CSV цели (с моделью) или низ передней грани (с коробкой)
     box_center: np.ndarray
     cab_center: np.ndarray
     speed_mps: float
@@ -172,9 +173,15 @@ class CabTracker:
     """
 
     def __init__(self, settings: TrackerSettings | None = None,
-                 dimensions: TruckDimensions = DEFAULT_DIMENSIONS):
+                 dimensions: TruckDimensions = DEFAULT_DIMENSIONS, model: TruckModel | None = None):
+        """
+        model — форма грузовика из 3D-модели: рамка измерения считается по проекции её
+        выпуклой оболочки, а точки вывода (точка CSV, центр кабины) берутся из геометрии модели.
+        Без модели — коробка dimensions и центр кабины по cab_center_back / cab_center_up.
+        """
         self.s = settings or TrackerSettings()
-        self.dims = dimensions.as_array()
+        self.model = model
+        self.dims = model.dimensions.copy() if model is not None else dimensions.as_array()
         self.state: np.ndarray | None = None
         self.P: np.ndarray | None = None
         self.heading_dir = np.array([1.0, 0.0, 0.0])
@@ -228,6 +235,14 @@ class CabTracker:
         return center + self.dims[0] / 2 * forward[0] - self.dims[2] / 2 * up[0]
 
     def _measure(self, center: np.ndarray, direction: np.ndarray, geometry: ObservationGeometry) -> np.ndarray:
+        if self.model is not None:
+            forward, side, up = (a[0] for a in truck_axes(direction[None, :]))
+            points = self.model.to_world(center, forward, side, up, self.model.hull)          # (K, 3)
+            cam = np.einsum("nij,nkj->nki", geometry.rotation, points[None, :, :] - geometry.position[:, None, :])
+            z = np.maximum(cam[..., 2], 1.0)
+            u = geometry.focal[:, 0:1] * cam[..., 0] / z + geometry.center[:, 0:1]
+            v = geometry.focal[:, 1:2] * cam[..., 1] / z + geometry.center[:, 1:2]
+            return np.c_[u.min(1), u.max(1), v.min(1), v.max(1)]
         n = len(geometry.position)
         reference = self._reference_point(center, direction)
         corners = box_corners(np.repeat(reference[None, :], n, axis=0), np.repeat(direction[None, :], n, axis=0),
@@ -322,9 +337,14 @@ class CabTracker:
         since = 0 if self._last_measured is None else frame - self._last_measured
 
         direction = self._direction(state)
-        forward, _, up = truck_axes(direction[None, :])
-        position = self._reference_point(state[:3], direction)
-        cab_center = position - s.cab_center_back * forward[0] + s.cab_center_up * up[0]
+        forward, side, up = truck_axes(direction[None, :])
+        if self.model is not None:
+            points = self.model.to_world(state[:3], forward[0], side[0], up[0],
+                                         np.vstack([self.model.csv_point, self.model.cab_center]))
+            position, cab_center = points[0], points[1]
+        else:
+            position = self._reference_point(state[:3], direction)
+            cab_center = position - s.cab_center_back * forward[0] + s.cab_center_up * up[0]
         speed = float(np.linalg.norm(state[3:]) * s.fps / s.units_per_meter)
         return FrameEstimate(frame, status, position, state[:3].copy(), cab_center, speed, float(np.arctan2(direction[1], direction[0])),
                              float(np.sqrt(P[0, 0] + P[1, 1])), len(detections), used_cameras, occluded_count, since)
@@ -333,14 +353,14 @@ class CabTracker:
 def run_tracker(observations: BoxObservations, camera_provider: CameraProvider, frames,
                 points: dict | None = None, reliable: dict | None = None,
                 settings: TrackerSettings | None = None,
-                dimensions: TruckDimensions = DEFAULT_DIMENSIONS) -> TrackResult:
+                dimensions: TruckDimensions = DEFAULT_DIMENSIONS, model: TruckModel | None = None) -> TrackResult:
     """
     Прогон трекера по кадрам по порядку (как в реальном времени).
 
     points / reliable — {(камера, кадр): (u, v)} и {(камера, кадр): bool} для инициализации
     по триангуляции центров масок.
     """
-    tracker = CabTracker(settings, dimensions)
+    tracker = CabTracker(settings, dimensions, model)
     by_frame: dict[int, list[int]] = {}
     for i, t in enumerate(observations.times.astype(int)):
         by_frame.setdefault(t, []).append(i)
