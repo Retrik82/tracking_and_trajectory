@@ -28,3 +28,5 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+# Локальные данные (видео, CSV, архивы) — не коммитим
+tmp/
