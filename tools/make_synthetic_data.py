@@ -1,11 +1,12 @@
 """
 Синтетическая сцена в формате проекта: CSV камер, CSV цели и «детекции» по коробке грузовика.
 
-Нужна, чтобы прогнать весь пайплайн (кроме detect и video) без видео, весов YOLO и 3D-модели:
-проверить код, посмотреть отчёт и графики, сравнить методы на данных с известной правдой.
+Нужна, чтобы прогнать конвейер (кроме detect и video) без видео, весов YOLO и 3D-модели:
+проверить код, посмотреть отчёт и графики, сравнить методы на данных с известной правдой,
+прогнать обязательные сценарии ТЗ (число камер, перекрытия, пропадание, выбросы, рассинхронизация).
 Это НЕ замена реальным данным: цифры на синтетике ничего не говорят о точности на видео.
 
-Что моделируется (похоже на реальную сцену, см. README):
+Базовая сцена (scenario = base), похожая на реальную (см. README):
 - грузовик — коробка DEFAULT_DIMENSIONS (16.5 × 2.55 × 4 м), едет по петле с переменной
   скоростью (до ~25 м/с, продольное ускорение до ~5 м/с², поперечное до ~6 м/с²);
 - точка CSV цели — низ передней грани коробки (то, что трекер выдаёт как position);
@@ -13,11 +14,14 @@
 - детекции: рамка проекции коробки с шумом, центр маски — проекция центра коробки с шумом,
   уверенность случайная; участки потери видимости: кадры 200–300 видит одна камера,
   кадры 500–514 не видит никто, Cam4 «заезжает за препятствие» (ребро съёживается) и пропадает,
-  редкие выбросы (ложная рамка).
+  редкие ложные детекции.
+
+Сценарии (--scenario, см. SCENARIOS): cams4 / cams3 / cams2 / cam1, occlusion, blackout, reappear,
+sharp_turn, accel_brake, speed_change, false_detection, outlier, desync, handover.
 
 Запуск:
     python tools/make_synthetic_data.py --data tmp/synthetic --out outputs/synthetic
-    python main.py --data tmp/synthetic --out outputs/synthetic --steps center,optimize,cab,realtime,approx,compare
+    python tools/make_synthetic_data.py --scenario cams2 --data tmp/scen/cams2 --out outputs/scen/cams2
 """
 
 import argparse
@@ -25,6 +29,7 @@ import csv
 import json
 import math
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -44,14 +49,81 @@ FPS = 30.0
 FOCAL_MM = {1: 35.0, 2: 60.0, 3: 35.0, 4: 50.0, 5: 20.0}
 
 
-def trajectory(frames: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+@dataclass
+class Scenario:
+    name: str = "base"
+    cameras: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 5])   # камеры с детекциями (остальные — пустой CSV)
+    single_camera_segment: tuple[int, int, int] | None = (200, 300, 3)    # (от, до, единственная камера)
+    blackouts: list[tuple[int, int]] = field(default_factory=lambda: [(500, 514)])   # никто не видит
+    occlusions: list[tuple[int, int, int]] = field(default_factory=lambda: [(2, 330, 360)])   # (камера, от, до)
+    shrink: tuple[int, int, int] | None = (4, 790, 812)                  # камера, ребро съёживается, затем пропадает
+    false_rate: float = 0.01                                             # ложная рамка (в другом месте кадра)
+    centroid_outlier_rate: float = 0.0                                   # центроид маски прыгает при верной рамке
+    noise_px: float = 4.0
+    centroid_noise_px: float = 6.0
+    speed_mean: float = 1600.0                                           # см/с
+    speed_amplitude: float = 800.0
+    speed_period_s: float = 15.0
+    ellipse: tuple[float, float] = (12000.0, 7000.0)                     # полуоси, см (меньше — круче повороты)
+    stop: tuple[int, int] | None = None                                  # остановка (кадры): скорость → 0
+    source_delays: dict = field(default_factory=dict)                    # рассинхронизация, кадров (режим detections)
+    overrides: dict = field(default_factory=dict)                        # параметры конфигурации для этого сценария
+
+
+SCENARIOS = {
+    "base": Scenario(),
+    "cams5": Scenario("cams5", single_camera_segment=None, blackouts=[], occlusions=[], shrink=None, false_rate=0.0),
+    "cams4": Scenario("cams4", cameras=[1, 2, 3, 5], single_camera_segment=None, blackouts=[], occlusions=[], shrink=None,
+                      false_rate=0.0),
+    "cams3": Scenario("cams3", cameras=[1, 3, 5], single_camera_segment=None, blackouts=[], occlusions=[], shrink=None,
+                      false_rate=0.0),
+    "cams2": Scenario("cams2", cameras=[1, 3], single_camera_segment=None, blackouts=[], occlusions=[], shrink=None,
+                      false_rate=0.0),
+    "cam1": Scenario("cam1", cameras=[3], single_camera_segment=None, blackouts=[], occlusions=[], shrink=None,
+                     false_rate=0.0),
+    "cam1_mono": Scenario("cam1_mono", cameras=[3], single_camera_segment=None, blackouts=[], occlusions=[], shrink=None,
+                          false_rate=0.0, overrides={"tracker.mono_init": True}),
+    "occlusion": Scenario("occlusion", single_camera_segment=None, blackouts=[],
+                          occlusions=[(1, 300, 360), (3, 320, 380), (5, 600, 640)], shrink=(4, 790, 812), false_rate=0.0),
+    "blackout": Scenario("blackout", single_camera_segment=None, blackouts=[(400, 430), (700, 760)], occlusions=[],
+                         shrink=None, false_rate=0.0),
+    "reappear": Scenario("reappear", single_camera_segment=None, blackouts=[(450, 470), (480, 500), (520, 560)],
+                         occlusions=[], shrink=None, false_rate=0.0),
+    "sharp_turn": Scenario("sharp_turn", ellipse=(9000.0, 4000.0), single_camera_segment=None, blackouts=[], occlusions=[],
+                           shrink=None, false_rate=0.0),
+    "accel_brake": Scenario("accel_brake", speed_mean=1500.0, speed_amplitude=1300.0, speed_period_s=8.0,
+                            single_camera_segment=None, blackouts=[], occlusions=[], shrink=None, false_rate=0.0),
+    "speed_change": Scenario("speed_change", stop=(450, 540), single_camera_segment=None, blackouts=[], occlusions=[],
+                             shrink=None, false_rate=0.0),
+    "false_detection": Scenario("false_detection", false_rate=0.08, single_camera_segment=None, blackouts=[], occlusions=[],
+                                shrink=None),
+    "outlier": Scenario("outlier", centroid_outlier_rate=0.05, single_camera_segment=None, blackouts=[], occlusions=[],
+                        shrink=None, false_rate=0.0),
+    "desync": Scenario("desync", source_delays={2: 1, 4: 2}, single_camera_segment=None, blackouts=[], occlusions=[],
+                       shrink=None, false_rate=0.0),
+    "handover": Scenario("handover", single_camera_segment=(150, 330, 1), blackouts=[], occlusions=[], shrink=None,
+                         false_rate=0.0),
+}
+
+
+def trajectory(frames: np.ndarray, sc: Scenario) -> tuple[np.ndarray, np.ndarray]:
     """Опорная точка (низ передней грани), см, и скорость, см/кадр. Петля с переменной скоростью."""
     t = frames / FPS
-    speed = 1600.0 + 800.0 * np.sin(2 * np.pi * t / 15.0)             # см/с: 8–24 м/с
-    # пройденный путь интегрированием скорости
+    speed = sc.speed_mean + sc.speed_amplitude * np.sin(2 * np.pi * t / sc.speed_period_s)
+    speed = np.maximum(speed, 100.0)
+    if sc.stop is not None:
+        a, b = sc.stop
+        ramp = 15
+        for i, f in enumerate(frames):
+            if a - ramp <= f < a:
+                speed[i] *= (a - f) / ramp
+            elif a <= f <= b:
+                speed[i] = 0.0
+            elif b < f <= b + ramp:
+                speed[i] *= (f - b) / ramp
     dt = 1.0 / FPS
     path = np.concatenate([[0.0], np.cumsum((speed[1:] + speed[:-1]) / 2 * dt)])
-    a, b = 12000.0, 7000.0                                             # полуоси эллипса, см
+    a, b = sc.ellipse
     perimeter = 2 * np.pi * np.sqrt((a ** 2 + b ** 2) / 2)
     theta = 2 * np.pi * path / perimeter
     x = a * np.cos(theta)
@@ -59,7 +131,12 @@ def trajectory(frames: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     z = 300.0 + 150.0 * np.sin(theta) + 40.0 * np.sin(3 * theta)      # лёгкий рельеф
     pos = np.c_[x, y, z]
     vel = np.gradient(pos, axis=0)
-    return pos, vel
+    # при остановке скорость нулевая, а курс (ориентация коробки) сохраняется — направление из касательной к пути
+    tangent = np.c_[-a * np.sin(theta), b * np.cos(theta), np.gradient(z)]
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+    speed_frame = np.linalg.norm(vel, axis=1, keepdims=True)
+    direction = tangent * np.maximum(speed_frame, 1.0)        # модуль не меньше 1 см/кадр: оси коробки определены
+    return pos, direction
 
 
 def look_at(position, target, focal_mm):
@@ -127,22 +204,25 @@ def visible_box(cam: Camera, corners: np.ndarray):
     return float(x1), float(x2), float(y1), float(y2)
 
 
-def make_detections(pos, vel, cams, rng, noise_px=4.0, centroid_noise_px=6.0):
+def make_detections(pos, vel, cams, rng, sc: Scenario):
     dims = DEFAULT_DIMENSIONS.as_array()
     corners_all = box_corners(pos, vel, dims)
     rows = {cam: [] for cam in cams}
     for f in range(NUM_FRAMES):
         for cam, cam_list in cams.items():
+            if cam not in sc.cameras:
+                continue
             c = cam_list[f]
             # сценарии потери видимости
-            if 200 <= f <= 300 and cam != 3:
-                continue                                    # видит только Cam3
-            if 500 <= f <= 514:
-                continue                                    # никто не видит
-            if cam == 2 and 330 <= f <= 360:
-                continue                                    # Cam2 за препятствием
-            if cam == 4 and f >= 812:
-                continue                                    # Cam4 потеряла после заезда за препятствие
+            if sc.single_camera_segment and sc.single_camera_segment[0] <= f <= sc.single_camera_segment[1] \
+                    and cam != sc.single_camera_segment[2]:
+                continue
+            if any(a <= f <= b for a, b in sc.blackouts):
+                continue
+            if any(cam == oc and a <= f <= b for oc, a, b in sc.occlusions):
+                continue
+            if sc.shrink and cam == sc.shrink[0] and f >= sc.shrink[2]:
+                continue                                    # потеряла после заезда за препятствие
             box = visible_box(c, corners_all[f])
             if box is None:
                 continue
@@ -150,14 +230,14 @@ def make_detections(pos, vel, cams, rng, noise_px=4.0, centroid_noise_px=6.0):
             width = x2 - x1
             if width < 12:
                 continue
-            x1 += rng.normal(0, noise_px)
-            x2 += rng.normal(0, noise_px)
-            y1 += rng.normal(0, noise_px)
-            y2 += rng.normal(0, noise_px)
-            if cam == 4 and 790 <= f < 812:
-                x2 -= 0.045 * width * (f - 789)             # правое ребро «съёживается» за препятствием
+            x1 += rng.normal(0, sc.noise_px)
+            x2 += rng.normal(0, sc.noise_px)
+            y1 += rng.normal(0, sc.noise_px)
+            y2 += rng.normal(0, sc.noise_px)
+            if sc.shrink and cam == sc.shrink[0] and sc.shrink[1] <= f < sc.shrink[2]:
+                x2 -= 0.045 * width * (f - sc.shrink[1] + 1)   # правое ребро «съёживается» за препятствием
             conf = float(np.clip(rng.normal(0.85, 0.08), 0.3, 0.99))
-            outlier = rng.random() < 0.01
+            outlier = rng.random() < sc.false_rate
             if outlier:                                     # ложная детекция: рамка в другом месте кадра
                 x1, x2 = x1 + rng.uniform(-400, 400), x2 + rng.uniform(-400, 400)
                 x1, x2 = min(x1, x2), max(x1, x2)
@@ -165,10 +245,13 @@ def make_detections(pos, vel, cams, rng, noise_px=4.0, centroid_noise_px=6.0):
             x1, x2 = np.clip([x1, x2], 0, IMAGE_WIDTH)
             y1, y2 = np.clip([y1, y2], 0, IMAGE_HEIGHT)
             center_uv = c.project(corners_all[f].mean(axis=0))
-            cu = float(center_uv[0] + rng.normal(0, centroid_noise_px))
-            cv = float(center_uv[1] + rng.normal(0, centroid_noise_px))
+            cu = float(center_uv[0] + rng.normal(0, sc.centroid_noise_px))
+            cv = float(center_uv[1] + rng.normal(0, sc.centroid_noise_px))
             if outlier:
                 cu, cv = (x1 + x2) / 2, (y1 + y2) / 2
+            elif rng.random() < sc.centroid_outlier_rate:   # выброс в координатах точки при верной рамке
+                cu += rng.uniform(-150, 150)
+                cv += rng.uniform(-80, 80)
             area = float(max((x2 - x1) * (y2 - y1) * 0.6, 1.0))
             m = 2.0
             edge_clipped = bool(x1 <= m or y1 <= m or x2 >= IMAGE_WIDTH - m or y2 >= IMAGE_HEIGHT - m)
@@ -180,36 +263,43 @@ def make_detections(pos, vel, cams, rng, noise_px=4.0, centroid_noise_px=6.0):
     return rows
 
 
-def main(argv=None) -> None:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", type=Path, default=Path("tmp/synthetic"))
-    p.add_argument("--out", type=Path, default=Path("outputs/synthetic"))
-    p.add_argument("--seed", type=int, default=0)
-    args = p.parse_args(argv)
-    rng = np.random.default_rng(args.seed)
-
+def generate(data_dir: Path, out_dir: Path, sc: Scenario, seed: int = 0) -> dict:
+    rng = np.random.default_rng(seed)
     frames = np.arange(NUM_FRAMES, dtype=float)
-    pos, vel = trajectory(frames)
+    pos, vel = trajectory(frames, sc)
     cams = camera_poses(pos)
-    args.data.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
     for cam, cam_list in cams.items():
-        write_camera_csv(camera_csv_path(args.data, cam), cam_list, FOCAL_MM[cam])
-    write_target_csv(target_csv_path(args.data), pos)
-
-    det_dir = args.out / "detections"
+        write_camera_csv(camera_csv_path(data_dir, cam), cam_list, FOCAL_MM[cam])
+    write_target_csv(target_csv_path(data_dir), pos)
+    det_dir = out_dir / "detections"
     det_dir.mkdir(parents=True, exist_ok=True)
-    rows = make_detections(pos, vel, cams, rng)
+    rows = make_detections(pos, vel, cams, rng, sc)
     for cam, dets in rows.items():
         with open(det_dir / f"cam{cam}.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=Detection.columns())
             w.writeheader()
             w.writerows(d.to_row() for d in dets)
         np.savez_compressed(det_dir / f"cam{cam}_polygons.npz")
-    (det_dir / "meta.json").write_text(json.dumps({"weights": "synthetic", "note": "синтетика, без YOLO"},
-                                                  ensure_ascii=False, indent=2))
+    (det_dir / "meta.json").write_text(json.dumps({"weights": "synthetic", "scenario": sc.name,
+                                                   "source_delays": sc.source_delays,
+                                                   "note": "синтетика, без YOLO"}, ensure_ascii=False, indent=2))
     speed = np.linalg.norm(vel, axis=1) * FPS / 100
-    print(f"данные: {args.data}, детекции: {det_dir}; скорость {speed.min():.1f}–{speed.max():.1f} м/с; "
-          + ", ".join(f"cam{c}: {len(d)} кадров" for c, d in rows.items()))
+    return {"scenario": sc.name, "speed_min": float(speed.min()), "speed_max": float(speed.max()),
+            "detections": {c: len(d) for c, d in rows.items()}, "source_delays": sc.source_delays}
+
+
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data", type=Path, default=Path("tmp/synthetic"))
+    p.add_argument("--out", type=Path, default=Path("outputs/synthetic"))
+    p.add_argument("--scenario", default="base", choices=sorted(SCENARIOS))
+    p.add_argument("--seed", type=int, default=0)
+    args = p.parse_args(argv)
+    info = generate(args.data, args.out, SCENARIOS[args.scenario], args.seed)
+    print(f"сценарий {info['scenario']}: данные {args.data}, детекции {args.out / 'detections'}; "
+          f"скорость {info['speed_min']:.1f}–{info['speed_max']:.1f} м/с; "
+          + ", ".join(f"cam{c}: {n} кадров" for c, n in info["detections"].items()))
 
 
 if __name__ == "__main__":

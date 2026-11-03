@@ -192,6 +192,8 @@ def test_partial_status_when_all_edges_occluded_or_clipped():
 
 def test_limits_clip_velocity_change():
     tracker = CabTracker()
+    tracker._confirmed = True                               # уверенный трек: пределы без ослабления
+    tracker.P = np.eye(6)
     s = tracker.s
     prior = np.array([0.0, 0, 0, 50.0, 0, 0])
     posterior = np.array([0.0, 0, 0, 80.0, 30.0, 0])
@@ -200,3 +202,139 @@ def test_limits_clip_velocity_change():
     lat_max = s.max_lateral_mps2 * s.accel_to_units
     assert out[3] == pytest.approx(50.0 + long_max)
     assert out[4] == pytest.approx(lat_max)
+
+
+# ---------------------------------------------------------------- модернизация: dt, ca, 3D-точка, курс
+
+def test_variable_dt_matches_skipped_frames():
+    obs, points = synthetic(seed=5)
+    full = run_tracker(obs, provider, FRAMES, points)
+    # тот же ряд, но каждый второй кадр после 60-го пропущен: dt = 2 кадра
+    keep = np.r_[FRAMES[:60], FRAMES[60::2]]
+    sub = obs.subset(np.isin(obs.times, keep))
+    skipped = run_tracker(sub, provider, keep, points)
+    err_full, _ = errors(full)
+    pos = skipped.array("position")
+    err_skip = np.linalg.norm(pos - path(keep), axis=1)
+    assert np.all(skipped.array("dt_frames")[61:] == 2.0)
+    assert np.nanmedian(err_skip[40:]) < 3 * max(np.nanmedian(err_full[40:]), 20.0)
+
+
+def test_constant_acceleration_model_tracks():
+    obs, points = synthetic(seed=6)
+    settings = TrackerSettings(motion_model="ca", edge_sigma_px=2.0)
+    result = run_tracker(obs, provider, FRAMES, points, settings=settings)
+    err, have = errors(result)
+    assert np.all(have[20:]) and np.median(err[40:]) < 60.0
+    acc = result.array("accel_magnitude_mps2")
+    assert np.all(np.isfinite(acc[20:]))
+
+
+def test_point_fusion_improves_or_keeps_accuracy_and_reports_quality():
+    from reconstruction.fusion import FusionSettings
+
+    obs, points = synthetic(seed=7, noise=3.0)
+    base = run_tracker(obs, provider, FRAMES, points)
+    fused = run_tracker(obs, provider, FRAMES, points, fusion=FusionSettings(mode="model_corrected", sigma_px=3.0))
+    err_b, _ = errors(base)
+    err_f, _ = errors(fused)
+    assert np.median(err_f[40:]) <= np.median(err_b[40:]) * 1.2
+    used = fused.array("point_used")
+    assert used[40:].mean() > 0.9
+    assert set(fused.array("quality")[40:]) <= {"point+edges", "point", "edges"}
+    nis = fused.array("point_nis")
+    assert np.nanmedian(nis[40:]) < 16
+
+
+def test_point_outlier_is_gated():
+    from reconstruction.fusion import FusionSettings
+
+    obs, points = synthetic(seed=8)
+    bad = dict(points)
+    ghost = path([100])[0] + [0.0, 600.0, 0.0]                  # согласованный ложный объект в 6 м сбоку
+    for cam in range(3):
+        bad[(cam, 100)] = tuple(CAMERAS[cam].project(ghost))
+    fused = run_tracker(obs, provider, FRAMES, bad, fusion=FusionSettings(mode="centroid"))
+    e = fused.estimates[100]
+    assert not e.point_used and e.point_nis > 16
+    assert fused.estimates[99].point_used and fused.estimates[101].point_used
+
+
+def test_heading_rate_limited_and_held_at_low_speed():
+    tracker = CabTracker(TrackerSettings(heading_rate_limit_dps=30.0))
+    tracker.heading = 0.0
+    tracker.heading_dir = np.array([1.0, 0.0, 0.0])
+    fast = np.array([0, 0, 0, 0.0, 50.0, 0.0])              # 15 м/с строго вдоль +Y (90°)
+    tracker._update_heading(fast, 1.0)
+    assert abs(np.degrees(tracker.heading) - 1.0) < 1e-6    # 30°/с = 1°/кадр (v/R = 107°/с не ограничивает)
+    tracker.heading = 0.0
+    tracker._v_smooth = None
+    crawl = np.array([0, 0, 0, 0.0, 20.0 / 3.0, 0.0])       # 2 м/с: предел v/R = 2/8 рад/с = 14.3°/с = 0.48°/кадр
+    tracker._update_heading(crawl, 1.0)
+    assert abs(np.degrees(tracker.heading) - np.degrees(2.0 / 8.0 / 30.0)) < 1e-6
+    slow = np.array([0, 0, 0, 0.0, 1.0, 0.0])               # 0.3 м/с — ниже порога, курс держится
+    before = tracker.heading
+    tracker._update_heading(slow, 1.0)
+    assert tracker.heading == before
+
+
+def test_false_detection_is_gated_when_track_confident():
+    obs, points = synthetic(seed=9)
+    bad = obs.edges.copy()
+    rows = np.nonzero((obs.times >= 100) & (obs.times < 110) & (obs.camera_indices == 0))[0]
+    bad[rows, 0] += 500                                     # ложная рамка далеко от прогноза на камере 0
+    bad[rows, 1] += 500
+    wrong = BoxObservations(obs.times, obs.frames, obs.camera_indices, bad, obs.edge_valid, obs.confidence)
+    gated = run_tracker(wrong, provider, FRAMES, points)
+    ungated = run_tracker(wrong, provider, FRAMES, points, settings=TrackerSettings(gate_iou=-1.0))
+    rej = [e.rejected_cameras for e in gated.estimates]
+    assert all(0 in r for r in rej[100:110])
+    e_g, _ = errors(gated)
+    e_u, _ = errors(ungated)
+    assert e_g[100:115].max() < e_u[100:115].max()
+
+
+def test_mono_initialization_with_single_camera():
+    obs, points = synthetic(seed=10, drop=lambda cam, f: cam != 1)      # видит только камера 1
+    result = run_tracker(obs, provider, FRAMES, points, settings=TrackerSettings(mono_init=True))
+    status = result.array("status")
+    assert np.any(status == MEASURED)
+    assert all(q == "mono" for q in result.array("quality")[np.nonzero(status == MEASURED)[0]])
+    err, have = errors(result)
+    assert have[60:].all() and np.nanmedian(err[60:]) < 1500          # грубо (дальность по высоте рамки), но трек есть
+    off = run_tracker(obs, provider, FRAMES, points)                   # по умолчанию выключено
+    assert np.all(off.array("status") == INITIALIZING)
+
+
+def test_stereo_reinitializes_unconfirmed_mono_track():
+    obs, points = synthetic(seed=11, drop=lambda cam, f: cam != 1 and f < 60)   # до кадра 60 — одна камера
+    result = run_tracker(obs, provider, FRAMES, points, settings=TrackerSettings(mono_init=True))
+    q = result.array("quality")
+    assert "mono" in set(q[20:60]) and "mono" not in set(q[80:])
+    err, _ = errors(result)
+    assert np.nanmedian(err[100:]) < 100
+
+
+def test_diverged_track_reinitializes_from_stereo():
+    from reconstruction.fusion import FusionSettings
+
+    obs, points = synthetic(seed=12)
+    settings = TrackerSettings(edge_sigma_px=2.0)
+    tracker = CabTracker(settings, DIMS, None, FusionSettings(mode="centroid", sigma_px=2.0))
+    by_frame = {}
+    for i, t in enumerate(obs.times.astype(int)):
+        by_frame.setdefault(t, []).append(i)
+    err = []
+    for f in FRAMES:
+        idx = by_frame.get(int(f), [])
+        dets = [(int(obs.camera_indices[i]), obs.edges[i], obs.edge_valid[i], obs.confidence[i],
+                 points[(int(obs.camera_indices[i]), int(f))], True) for i in idx]
+        cams = {int(obs.camera_indices[i]): CAMERAS[int(obs.camera_indices[i])] for i in idx}
+        if f == 60:                                        # сбить трек: унести состояние на 60 м вбок
+            tracker.state[:3] += [0.0, 6000.0, 0.0]
+            tracker.P[:3, :3] = np.eye(3) * 100.0 ** 2
+        e = tracker.step(int(f), cams, dets)
+        err.append(np.linalg.norm(e.position - path([f])[0]) if np.all(np.isfinite(e.position)) else np.nan)
+    err = np.array(err)
+    assert err[61] > 3000                                   # сразу после сбоя трек далеко
+    assert np.nanmedian(err[100:]) < 100                    # после переинициализации — снова точен

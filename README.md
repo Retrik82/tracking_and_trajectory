@@ -39,6 +39,34 @@ python main.py --data tmp/synthetic --out outputs/synthetic --no-video
 `metrics_summary.csv`). Обзор кода, последовательность действий и предложения по точности —
 [docs/PIPELINE_REVIEW.md](docs/PIPELINE_REVIEW.md).
 
+## Потоковая система (реальное время)
+
+Отдельная точка входа `stream.py` — потоковый конвейер: кадры → адаптивный выбор камер → YOLO →
+триангуляция с согласованием точек по 3D-модели → фильтр Калмана → скользящий B-сплайн → запись и
+видео. Архитектура и математика — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), результаты и
+ограничения — [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md).
+
+```bash
+.venv/bin/python stream.py replay --data tmp/project2 --video          # демонстрация: видео в реальном темпе, YOLO, наложение
+.venv/bin/python stream.py live --config configs/live.json             # живые потоки (cameras.live_sources в конфиге)
+.venv/bin/python stream.py detections --data tmp/project2 --detections outputs/main/detections --no-pacing
+                                                                       # готовые детекции, без YOLO: алгоритмы и метрики
+.venv/bin/python stream.py variants --data tmp/project2 --detections outputs/main/detections
+                                                                       # сравнение архитектур A–E на одних детекциях
+.venv/bin/python stream.py scenarios                                   # сценарии ТЗ на синтетике
+.venv/bin/python stream.py config > configs/my.json                    # все параметры (JSON), затем --config configs/my.json
+```
+
+Результаты в `outputs/stream/`: `stream_track.csv` (REALTIME TRACK: X Y Z, V, |a|, курс, СКО, статус,
+камеры, NIS, репроекция, задержка; SMOOTHED TRACK с его кадром), `smoothed_track.csv`,
+`performance_report.md/json` (тиков/с, задержка p50/p95, FPS камер, изображений YOLO/с, активные
+камеры, пропуски, время этапов), `plots/` (X(t), Y(t), Z(t), V(t), |a|(t), ошибка по осям и
+неопределённость, камеры и задержка), `videos/stream_cam{N}.mp4` (`--video`).
+
+Режимы: `replay` — записанные видео с исходной частотой и общим стартом; `live` — URL/устройства;
+`detections` — готовые детекции без кадров (единственный режим без весов и видео). Все параметры —
+`pipeline/config.py` (`--set раздел.ключ=значение`), число камер — `cameras.ids`.
+
 ## Как обрабатывается видео
 
 ```
@@ -101,10 +129,18 @@ python main.py --data tmp/synthetic --out outputs/synthetic --no-video
 ## Файлы
 
 ```
-main.py                     итоговая точка входа: по умолчанию все шаги с видео; проверка данных и весов
+main.py                     офлайн-конвейер и сравнение методов: по умолчанию все шаги с видео
+stream.py                   потоковая система: replay / live / detections / variants / scenarios / plots / config
+docs/ARCHITECTURE.md        архитектура потоковой системы и математика компонентов
+docs/FINAL_REPORT.md        итоговый отчёт по модернизации: что сделано, измерено, ограничения
 docs/PIPELINE_REVIEW.md     обзор кода: последовательность действий, проверка, предложения по ТЗ
-tools/make_synthetic_data.py синтетическая сцена в формате проекта (CSV камер и цели, детекции) для проверки без видео
+tools/make_synthetic_data.py синтетическая сцена в формате проекта (CSV камер и цели, детекции); сценарии ТЗ (--scenario)
+tools/run_scenarios.py      прогон сценариев ТЗ (число камер, перекрытия, потери, выбросы, рассинхронизация) по вариантам A–E
 pipeline/
+  config.py                 конфигурация потоковой системы (JSON + --set)
+  streaming.py              потоковый конвейер: источники, очереди, синхронизация, тики, метрики, видео
+  variants.py               сравнение архитектур A–E на одних детекциях (точность, кинематика, потери, производительность)
+  stream_plots.py           графики потока: координаты, скорость/ускорение, ошибки, неопределённость, камеры
   run.py                    шаги optimize, cab, realtime, approx, compare, video; аргументы; сводка метрик
   detect.py                 шаг detect: YOLO по видео -> CSV детекций
   coverage.py               вид сверху: поля зрения, загораживание, препятствия по лучам (space carving)
@@ -125,7 +161,10 @@ reconstruction/
   cab_model.py              офлайн-модель коробки: углы, проекция рамки, подгонка ко всему видео
   fbx_reader.py             чтение бинарного FBX без внешних библиотек
   truck_model.py            форма грузовика из FBX: оболочка, центр кабины, точка CSV, масштаб сцены
-  visibility.py             трекер реального времени с обработкой потери видимости
+  visibility.py             фильтр Калмана реального времени: рёбра + 3D-точка, dt, CV/CA, курс, пределы, потеря видимости
+  fusion.py                 триангуляция реального времени: геометрическое качество, ковариация, согласование точек по модели
+  camera_scheduler.py       адаптивный выбор камер ACTIVE / PROBE / SLEEP по прогнозу видимости и неопределённости
+  streaming_bspline.py      скользящий B-сплайн: окно, IRLS-Хьюбер, регуляризация, фоновый поток, SMOOTHED TRACK
   approximation.py          базовый вариант: полином по окну (реальное время) и по всем точкам (офлайн) на 3D-точках
 models/README.md            какие файлы положить в models/
 tests/                      pytest; conftest.py — путь к данным (PELENG_DATA_DIR) и камеры по кадрам

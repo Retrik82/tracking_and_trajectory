@@ -25,7 +25,8 @@
                                                                # синтетика (tools/make_synthetic_data.py), без видео и YOLO
 
 Данные: --data (видео Way1.FinalImage.CineCameraActor{N}.mp4, CSV камер и цели), модели: --weights, --truck-fbx.
-Все параметры: --help. Подробно о потоке обработки и файлах — README.md, обзор кода — docs/PIPELINE_REVIEW.md.
+Все параметры: --help. Потоковая система реального времени (replay / live / detections, сравнение A–E, сценарии) — stream.py.
+Подробно о потоке обработки и файлах — README.md, обзор кода — docs/PIPELINE_REVIEW.md, архитектура — docs/ARCHITECTURE.md.
 """
 
 import sys
