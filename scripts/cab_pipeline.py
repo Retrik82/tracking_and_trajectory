@@ -23,12 +23,15 @@ import numpy as np
 
 from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
 from reconstruction.cab_model import (
+    CAB_CENTER_BACK,
+    CAB_CENTER_UP,
     DEFAULT_DIMENSIONS,
     BoxObservations,
     TruckDimensions,
     box_corners,
     fit_cab_trajectory,
     initial_cab_trajectory,
+    offset_point_trajectory,
 )
 from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera, video_path
 from reconstruction.objective import ObjectiveData
@@ -41,14 +44,15 @@ from scripts.yolo_eval import build_parser, load_detections, run_detection, setu
 
 log = logging.getLogger("yolo_eval")
 ALL_STEPS = ["detect", "center", "optimize", "cab", "compare"]
-MAIN_METHOD = "cab"
+MAIN_METHOD = "cab_center"
 METHOD_NAMES = {
     "triangulation": "Центр маски: триангуляция",
     "center": "Центр маски: начальный сплайн",
     "optimized": "Центр маски: оптимизация по пикселям",
-    "cab": "Кабина: модель коробки (основной)",
+    "cab": "Кабина: низ передней грани",
+    "cab_center": "Кабина: центр кабины (основной)",
 }
-METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "optimized": MAGENTA, "cab": BLUE}
+METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "optimized": MAGENTA, "cab": AQUA, "cab_center": BLUE}
 
 
 def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -63,6 +67,10 @@ def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     g.add_argument("--lambda-acceleration", type=float, default=10.0)
     g.add_argument("--lambda-jerk", type=float, default=100.0)
     g.add_argument("--max-nfev", type=int, default=3000)
+    g.add_argument("--cab-center-back", type=float, default=CAB_CENTER_BACK,
+                   help="центр кабины: насколько назад от передней грани, ед. мира (допущение, см. cab_model)")
+    g.add_argument("--cab-center-up", type=float, default=CAB_CENTER_UP,
+                   help="центр кабины: насколько выше низа передней грани, ед. мира")
     return p
 
 
@@ -125,7 +133,12 @@ def step_cab(args, detections, center: BSplineTrajectory) -> dict:
              d.width / args.units_per_meter, d.height / args.units_per_meter)
     np.savez(args.out / "cab_spline.npz", knots=fit.trajectory.knots, control_points=fit.trajectory.control_points,
              dimensions=d.as_array())
-    return {"trajectory": fit.trajectory, "dimensions": d, "edge_errors_px": fit.edge_errors_px,
+    center_trajectory = offset_point_trajectory(fit.trajectory, args.cab_center_back, args.cab_center_up)
+    np.savez(args.out / "cab_center_spline.npz", knots=center_trajectory.knots,
+             control_points=center_trajectory.control_points,
+             offset_back_up=np.array([args.cab_center_back, args.cab_center_up]))
+    return {"trajectory": fit.trajectory, "center_trajectory": center_trajectory, "dimensions": d,
+            "edge_errors_px": fit.edge_errors_px,
             "converged": bool(fit.scipy_result.success), "nfev": int(fit.scipy_result.nfev),
             "observations": observations}
 
@@ -148,7 +161,8 @@ def evaluate_methods(args, detections, center_result, optimized, cab) -> tuple[d
     ctx = center_result["ctx"]
     detected_cams = np.array([sum(f in detections[c] for c in CAMERAS) for f in frames])
     series = {"triangulation": {"points": np.where(ctx["ok"][:, None], ctx["tri_points"], np.nan), "spline": None}}
-    for name, spline in (("center", center_result["spline"]), ("optimized", optimized), ("cab", cab["trajectory"])):
+    for name, spline in (("center", center_result["spline"]), ("optimized", optimized), ("cab", cab["trajectory"]),
+                         ("cab_center", cab["center_trajectory"])):
         series[name] = {"points": np.full((NUM_VIDEO_FRAMES, 3), np.nan), "spline": spline}
         span = (frames >= spline.t_start) & (frames <= spline.t_end)
         series[name]["points"][span] = spline.evaluate(frames[span].astype(float))
@@ -200,7 +214,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     note = "YOLO обучена на этих же видео"
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    for name in ("center", "optimized", "cab"):
+    for name in ("center", "optimized", "cab", "cab_center"):
         ax.plot(frames, c["series"][name]["error"], color=METHOD_COLORS[name], lw=2.5 if name == MAIN_METHOD else 1.5,
                 label=METHOD_NAMES[name])
     ax.scatter(frames, c["series"]["triangulation"]["error"], s=5, color=ORANGE, alpha=0.5, lw=0,
@@ -217,7 +231,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     fig, ax = plt.subplots(figsize=(11, 6.5))
     gt = c["gt"] / upm
     ax.plot(gt[:, 0], gt[:, 1], color=INK_2, lw=2, label="цель (CSV)")
-    for name in ("center", "cab"):
+    for name in ("center", "cab_center"):
         p = c["series"][name]["points"] / upm
         ax.plot(p[:, 0], p[:, 1], color=METHOD_COLORS[name], lw=2, label=METHOD_NAMES[name])
     ax.set_aspect("equal")
@@ -231,7 +245,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
 
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(12, 6.5), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     a1.plot(frames, c["gt_speed"], color=INK_2, lw=2, label="цель (CSV)")
-    for name in ("center", "cab"):
+    for name in ("center", "cab_center"):
         a1.plot(frames, c["series"][name]["speed"], color=METHOD_COLORS[name], lw=1.8, label=METHOD_NAMES[name])
         a2.plot(frames, c["series"][name]["speed"] - c["gt_speed"], color=METHOD_COLORS[name], lw=1.5)
     a2.axhline(0, color=MUTED, lw=1)
@@ -244,7 +258,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     fig.savefig(out / "03_speed.png")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(11, 4.2))
+    fig, ax = plt.subplots(figsize=(12, 4.4))
     names = list(METHOD_NAMES)
     x = np.arange(len(names))
     med = [c["metrics"][n]["position_m"]["median"] for n in names]
@@ -306,6 +320,12 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
         "это «эффективная» коробка для рамок детектора, а не реальный размер грузовика). "
         f"Оптимизация: {'сошлась' if cab['converged'] else 'не сошлась'}, итераций {cab['nfev']}.",
         "",
+        f"Центр кабины — точка на {args.cab_center_back / upm:.2f} м назад от передней грани и на "
+        f"{args.cab_center_up / upm:.2f} м выше её низа (допущение о типичной кабине, задаётся "
+        "`--cab-center-back`/`--cab-center-up`). Точка CSV цели — опорная точка модели в Unreal, она ниже "
+        "и впереди центра кабины, поэтому ошибка центра кабины относительно CSV включает это постоянное "
+        "смещение. Строка «низ передней грани» показывает точность той же подгонки в точке, ближайшей к CSV.",
+        "",
         "## Сравнение с CSV цели, м (медиана / p95 / RMSE / максимум)",
         "",
         "| Вариант | кадров | ошибка положения | без постоянного смещения | смещение вдоль / поперёк / верт., м "
@@ -344,16 +364,19 @@ def render_videos(args, detections, cab: dict, c: dict) -> None:
     out_dir = args.out / "videos"
     out_dir.mkdir(parents=True, exist_ok=True)
     traj, dims = cab["trajectory"], cab["dimensions"].as_array()
+    cab_point = cab["center_trajectory"]
     frames = c["frames"]
     span = (frames >= traj.t_start) & (frames <= traj.t_end)
     pts = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
     vel = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
-    pts[span] = traj.evaluate(frames[span].astype(float))
+    ref = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
+    ref[span] = traj.evaluate(frames[span].astype(float))
     vel[span] = traj.derivative().evaluate(frames[span].astype(float))
+    pts[span] = cab_point.evaluate(frames[span].astype(float))
     corners = np.full((NUM_VIDEO_FRAMES, 8, 3), np.nan)
-    corners[span] = box_corners(pts[span], vel[span], dims)
-    speed = c["series"]["cab"]["speed"]
-    err = c["series"]["cab"]["error"]
+    corners[span] = box_corners(ref[span], vel[span], dims)
+    speed = c["series"][MAIN_METHOD]["speed"]
+    err = c["series"][MAIN_METHOD]["error"]
     upm = args.units_per_meter
 
     def bgr(h):
@@ -392,7 +415,7 @@ def render_videos(args, detections, cab: dict, c: dict) -> None:
                 if np.all(np.isfinite(g)):
                     cv2.drawMarker(img, (int(g[0]), int(g[1])), bgr(AQUA), cv2.MARKER_DIAMOND, 14, 2, cv2.LINE_AA)
             n = int(c["detected_cams"][f])
-            lines = [f"Cam{cam}  frame {f}  CAB POINT"]
+            lines = [f"Cam{cam}  frame {f}  CAB CENTER"]
             if span[f]:
                 q = pts[f] / upm
                 lines += [f"X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} m",
@@ -407,7 +430,7 @@ def render_videos(args, detections, cab: dict, c: dict) -> None:
             for i, text in enumerate(lines):
                 color = bgr(ORANGE) if text.startswith("SPLINE ONLY") else (255, 255, 255)
                 cv2.putText(img, text, (20, 38 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-            legend = [("truck box (fitted)", BLUE), ("cab point + trail", YELLOW), ("detector box", MUTED),
+            legend = [("truck box (fitted)", BLUE), ("cab center + trail", YELLOW), ("detector box", MUTED),
                       ("target CSV", AQUA)]
             for i, (text, col) in enumerate(legend):
                 y = IMAGE_HEIGHT - 20 - 26 * (len(legend) - 1 - i)
@@ -453,7 +476,9 @@ def run(args) -> None:
         data = np.load(args.out / "cab_spline.npz")
         observations = BoxObservations.from_detections([d for cam in detections.values() for d in cam.values()],
                                                        frame_offset=args.frame_offset)
-        cab = {"trajectory": load_spline(args.out / "cab_spline.npz"), "dimensions": TruckDimensions(*data["dimensions"]),
+        trajectory = load_spline(args.out / "cab_spline.npz")
+        cab = {"trajectory": trajectory, "dimensions": TruckDimensions(*data["dimensions"]),
+               "center_trajectory": offset_point_trajectory(trajectory, args.cab_center_back, args.cab_center_up),
                "edge_errors_px": np.full((len(observations.times), 4), np.nan), "converged": False, "nfev": 0,
                "observations": observations}
 

@@ -58,6 +58,13 @@ DEFAULT_DIMENSIONS = TruckDimensions(length=1650.0, width=255.0, height=400.0)
 DEFAULT_DIMENSION_BOUNDS = None
 
 
+# Центр кабины относительно опорной точки (низ передней грани по центру), единицы мира.
+# Типичная кабина тягача: длина ~2.3 м, передняя грань от бампера до крыши ~0.3–3.8 м.
+# Это допущение, а не измерение: реальные значения берутся из модели грузовика в Unreal.
+CAB_CENTER_BACK = 120.0
+CAB_CENTER_UP = 200.0
+
+
 @dataclass
 class BoxObservations:
     """
@@ -156,6 +163,26 @@ def initial_cab_trajectory(center: BSplineTrajectory, dims: TruckDimensions,
     if knot_spacing is None:
         return fit_initial_bspline(times, points, num_control_points=len(center.control_points))
     return fit_initial_bspline(times, points, knot_spacing=knot_spacing)
+
+
+def offset_point_trajectory(trajectory: BSplineTrajectory, back: float = CAB_CENTER_BACK,
+                            up: float = CAB_CENTER_UP) -> BSplineTrajectory:
+    """
+    Траектория точки, жёстко связанной с грузовиком: опорная точка − back·вперёд + up·вверх.
+
+    Оси грузовика берутся из касательной исходного сплайна. Результат — сплайн на том же
+    узловом векторе, подогнанный по точкам на каждом кадре, поэтому производные
+    (скорость, ускорение) считаются так же, как для исходной траектории.
+    """
+    times = np.linspace(trajectory.t_start, trajectory.t_end,
+                        max(int(round(trajectory.t_end - trajectory.t_start)) + 1, 2 * len(trajectory.control_points)))
+    forward, _, up_axis = truck_axes(trajectory.derivative().evaluate(times))
+    points = trajectory.evaluate(times) - back * forward + up * up_axis
+    from scipy.interpolate import BSpline
+
+    basis = BSpline.design_matrix(times, trajectory.knots, trajectory.degree).toarray()
+    control_points = np.linalg.lstsq(basis, points, rcond=None)[0]
+    return build_trajectory(trajectory, control_points)
 
 
 @dataclass

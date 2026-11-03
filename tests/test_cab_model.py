@@ -12,6 +12,7 @@ from reconstruction.cab_model import (
     box_corners,
     fit_cab_trajectory,
     initial_cab_trajectory,
+    offset_point_trajectory,
     project_box,
     truck_axes,
 )
@@ -185,3 +186,14 @@ def test_bad_observations_rejected():
         BoxObservations([1.0], [1], [0, 1], [[0, 1, 0, 1]], [[True] * 4], [1.0])
     with pytest.raises(ValueError):
         BoxObservations([], [], [], np.zeros((0, 4)), np.zeros((0, 4), bool), [])
+
+
+def test_cab_center_offset_in_truck_axes(true_spline):
+    center = offset_point_trajectory(true_spline, back=120.0, up=200.0)
+    t = np.array([5.0, 60.0, 115.0])
+    forward, _, up = truck_axes(true_spline.derivative().evaluate(t))
+    expected = true_spline.evaluate(t) - 120.0 * forward + 200.0 * up
+    np.testing.assert_allclose(center.evaluate(t), expected, atol=1.0)
+    np.testing.assert_allclose(center.knots, true_spline.knots)
+    # Нулевое смещение — та же траектория
+    np.testing.assert_allclose(offset_point_trajectory(true_spline, 0, 0).evaluate(t), true_spline.evaluate(t), atol=1e-6)
