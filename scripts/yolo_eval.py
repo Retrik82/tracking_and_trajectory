@@ -95,8 +95,8 @@ def load_polygons(out: Path, cam: int) -> dict[int, np.ndarray]:
 
 # ---------------------------------------------------------------- запуск
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def build_parser(description: str = __doc__) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--weights", type=Path, default=Path("models/best.pt"))
     p.add_argument("--data", type=Path, default=Path("tmp/project2"))
     p.add_argument("--out", type=Path, default=Path("outputs/yolo_eval"))
@@ -114,16 +114,24 @@ def parse_args(argv=None):
     p.add_argument("--huber-scale", type=float, default=100.0, help="порог Huber для сплайна, единицы мира")
     p.add_argument("--units-per-meter", type=float, default=100.0, help="единицы мира в метре (UE: см)")
     p.add_argument("--fps", type=float, default=30.0)
-    return p.parse_args(argv)
+    return p
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
+
+
+def setup_logging(out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(out / "run.log", encoding="utf-8")],
+    )
 
 
 def main(argv=None):
     args = parse_args(argv)
-    args.out.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(args.out / "run.log", encoding="utf-8")],
-    )
+    setup_logging(args.out)
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
     if args.video and "video" not in steps:
         steps.append("video")

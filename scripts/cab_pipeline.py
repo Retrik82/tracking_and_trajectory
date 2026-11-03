@@ -1,0 +1,478 @@
+"""
+Основной пайплайн: траектория точки кабины грузовика по видео пяти камер.
+
+Шаги:
+  detect    YOLO по всем видео (кешируется в <out>/detections)
+  center    базовый вариант по центру маски: триангуляция + начальный B-сплайн (<out>/center);
+            он же — начальное приближение для кабины
+  optimize  оптимизация сплайна центра маски по пикселям (для сравнения)
+  cab       основной результат: точка кабины по 3D-коробке, подогнанной к рамкам всех камер
+  compare   метрики всех вариантов против CSV цели, графики, report.md
+  video     видео с наложением коробки и траектории кабины (флаг --video)
+"""
+
+import argparse
+import copy
+import json
+import logging
+import subprocess
+import time
+from pathlib import Path
+
+import numpy as np
+
+from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
+from reconstruction.cab_model import (
+    DEFAULT_DIMENSIONS,
+    BoxObservations,
+    TruckDimensions,
+    box_corners,
+    fit_cab_trajectory,
+    initial_cab_trajectory,
+)
+from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera, video_path
+from reconstruction.objective import ObjectiveData
+from reconstruction.optimizer import optimize_trajectory
+from scripts.yolo_analysis import (
+    AQUA, BLUE, INK_2, MAGENTA, MUTED, ORANGE, YELLOW, CAMERA_COLORS, CAMERAS, NUM_VIDEO_FRAMES,
+    _style, debiased_norm, find_gaps, run_evaluation, stats, truck_frame_components,
+)
+from scripts.yolo_eval import build_parser, load_detections, run_detection, setup_logging
+
+log = logging.getLogger("yolo_eval")
+ALL_STEPS = ["detect", "center", "optimize", "cab", "compare"]
+MAIN_METHOD = "cab"
+METHOD_NAMES = {
+    "triangulation": "Центр маски: триангуляция",
+    "center": "Центр маски: начальный сплайн",
+    "optimized": "Центр маски: оптимизация по пикселям",
+    "cab": "Кабина: модель коробки (основной)",
+}
+METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "optimized": MAGENTA, "cab": BLUE}
+
+
+def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    p.set_defaults(out=Path("outputs/main"), steps=",".join(ALL_STEPS))
+    g = p.add_argument_group("кабина")
+    g.add_argument("--cab-knot-spacing", type=float, default=10.0, help="шаг узлов сплайна кабины, кадры")
+    g.add_argument("--truck-length", type=float, default=DEFAULT_DIMENSIONS.length, help="начальная длина, ед. мира")
+    g.add_argument("--truck-width", type=float, default=DEFAULT_DIMENSIONS.width)
+    g.add_argument("--truck-height", type=float, default=DEFAULT_DIMENSIONS.height)
+    g.add_argument("--fixed-dimensions", action="store_true",
+                   help="не подбирать габариты (если известны из сцены Unreal)")
+    g.add_argument("--lambda-acceleration", type=float, default=10.0)
+    g.add_argument("--lambda-jerk", type=float, default=100.0)
+    g.add_argument("--max-nfev", type=int, default=3000)
+    return p
+
+
+def camera_provider(args):
+    return lambda cam, frame: make_camera(args.data, cam, frame)
+
+
+# ---------------------------------------------------------------- шаги
+
+def step_center(args, detections) -> dict:
+    center_args = copy.copy(args)
+    center_args.out = args.out / "center"
+    result = run_evaluation(center_args, detections)
+    np.savez(args.out / "center_spline.npz", knots=result["spline"].knots,
+             control_points=result["spline"].control_points)
+    return result
+
+
+def load_spline(path: Path) -> BSplineTrajectory:
+    d = np.load(path)
+    return BSplineTrajectory(d["knots"], d["control_points"], 3, float(d["knots"][0]), float(d["knots"][-1]))
+
+
+def step_optimize(args, detections, center: BSplineTrajectory) -> BSplineTrajectory:
+    rows = [d for cam in detections.values() for d in cam.values()
+            if not d.unreliable and center.t_start <= d.frame <= center.t_end]
+    data = ObjectiveData(
+        times=np.array([d.frame for d in rows], float),
+        camera_indices=np.array([d.camera for d in rows]),
+        pixels=np.array([[d.point_u, d.point_v] for d in rows]),
+        confidence=np.array([d.confidence for d in rows]),
+        frames=np.array([d.frame + args.frame_offset for d in rows]),
+    )
+    started = time.time()
+    result = optimize_trajectory(center, camera_provider(args), data, max_nfev=2000,
+                                 lambda_acceleration=args.lambda_acceleration, lambda_jerk=args.lambda_jerk)
+    log.info("оптимизация центра маски: %d наблюдений, %.1f с, %s", len(rows), time.time() - started,
+             result.scipy_result.message)
+    np.savez(args.out / "optimized_spline.npz", knots=result.trajectory.knots,
+             control_points=result.trajectory.control_points)
+    return result.trajectory
+
+
+def step_cab(args, detections, center: BSplineTrajectory) -> dict:
+    observations = BoxObservations.from_detections(
+        [d for cam in detections.values() for d in cam.values()],
+        width=IMAGE_WIDTH, height=IMAGE_HEIGHT, frame_offset=args.frame_offset,
+    )
+    dims = TruckDimensions(args.truck_length, args.truck_width, args.truck_height)
+    initial = initial_cab_trajectory(center, dims, knot_spacing=args.cab_knot_spacing)
+    started = time.time()
+    fit = fit_cab_trajectory(
+        initial, camera_provider(args), observations, dimensions=dims,
+        fit_dimensions=not args.fixed_dimensions, lambda_acceleration=args.lambda_acceleration,
+        lambda_jerk=args.lambda_jerk, max_nfev=args.max_nfev,
+    )
+    d = fit.dimensions
+    log.info("кабина: %d рамок, %.1f с, %s; габариты %.2f × %.2f × %.2f м", len(observations.times),
+             time.time() - started, fit.scipy_result.message, d.length / args.units_per_meter,
+             d.width / args.units_per_meter, d.height / args.units_per_meter)
+    np.savez(args.out / "cab_spline.npz", knots=fit.trajectory.knots, control_points=fit.trajectory.control_points,
+             dimensions=d.as_array())
+    return {"trajectory": fit.trajectory, "dimensions": d, "edge_errors_px": fit.edge_errors_px,
+            "converged": bool(fit.scipy_result.success), "nfev": int(fit.scipy_result.nfev),
+            "observations": observations}
+
+
+# ---------------------------------------------------------------- сравнение
+
+def evaluate_methods(args, detections, center_result, optimized, cab) -> tuple[dict, dict]:
+    upm, fps = args.units_per_meter, args.fps
+    target = load_target(args.data)
+    frames = np.arange(NUM_VIDEO_FRAMES)
+    gt = np.array([target.position(f + args.frame_offset) for f in frames])
+    gt_valid = np.all(np.isfinite(gt), axis=1)
+    gt_spline = fit_initial_bspline(target.frames[target.valid].astype(float), target.positions[target.valid],
+                                    knot_spacing=5)
+    csv_t = np.clip((frames + args.frame_offset).astype(float), gt_spline.t_start, gt_spline.t_end)
+    gt_vel = gt_spline.derivative().evaluate(csv_t)
+    gt_speed = np.linalg.norm(gt_vel, axis=1) * fps / upm
+    moving = np.linalg.norm(gt_vel, axis=1) * fps / upm > 1.0
+
+    ctx = center_result["ctx"]
+    detected_cams = np.array([sum(f in detections[c] for c in CAMERAS) for f in frames])
+    series = {"triangulation": {"points": np.where(ctx["ok"][:, None], ctx["tri_points"], np.nan), "spline": None}}
+    for name, spline in (("center", center_result["spline"]), ("optimized", optimized), ("cab", cab["trajectory"])):
+        series[name] = {"points": np.full((NUM_VIDEO_FRAMES, 3), np.nan), "spline": spline}
+        span = (frames >= spline.t_start) & (frames <= spline.t_end)
+        series[name]["points"][span] = spline.evaluate(frames[span].astype(float))
+
+    metrics = {}
+    for name, s in series.items():
+        pts = s["points"]
+        has = np.all(np.isfinite(pts), axis=1)
+        err = np.linalg.norm(pts - gt, axis=1) / upm
+        along, cross, vertical = truck_frame_components((pts - gt) / upm, gt_vel)
+        comp_mask = has & gt_valid & moving
+        debiased, bias = debiased_norm(along, cross, vertical, comp_mask)
+        m = {
+            "frames": int((has & gt_valid).sum()),
+            "position_m": stats(err[has & gt_valid]),
+            "bias_m": bias,
+            "position_without_bias_m": stats(debiased[comp_mask]),
+            "by_detected_cameras": {int(k): stats(err[has & gt_valid & (detected_cams == k)])
+                                    for k in range(1, 5) if np.any(has & gt_valid & (detected_cams == k))},
+        }
+        if s["spline"] is not None:
+            sp = s["spline"]
+            span = has
+            vel = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
+            acc = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
+            vel[span] = sp.derivative(1).evaluate(frames[span].astype(float)) * fps / upm
+            acc[span] = sp.derivative(2).evaluate(frames[span].astype(float)) * fps ** 2 / upm
+            speed = np.linalg.norm(vel, axis=1)
+            s["speed"] = speed
+            path = float(np.sum(np.linalg.norm(np.diff(pts[span], axis=0), axis=1)) / upm)
+            gt_path = float(np.sum(np.linalg.norm(np.diff(gt_spline.evaluate(csv_t[span]), axis=0), axis=1)) / upm)
+            m["kinematics"] = {
+                "speed_max_mps": float(np.nanmax(speed)),
+                "speed_error_mps": stats(np.abs(speed - gt_speed)[span]),
+                "accel_max_mps2": float(np.nanmax(np.linalg.norm(acc, axis=1))),
+                "path_m": path, "target_path_m": gt_path,
+            }
+        s["error"] = err
+        metrics[name] = m
+
+    ctx_out = dict(frames=frames, gt=gt, gt_valid=gt_valid, gt_speed=gt_speed, series=series,
+                   detected_cams=detected_cams, target_issues=target.issues)
+    return metrics, ctx_out
+
+
+def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
+    plt = _style()
+    upm, frames = args.units_per_meter, c["frames"]
+    note = "YOLO обучена на этих же видео"
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for name in ("center", "optimized", "cab"):
+        ax.plot(frames, c["series"][name]["error"], color=METHOD_COLORS[name], lw=2.5 if name == MAIN_METHOD else 1.5,
+                label=METHOD_NAMES[name])
+    ax.scatter(frames, c["series"]["triangulation"]["error"], s=5, color=ORANGE, alpha=0.5, lw=0,
+               label=METHOD_NAMES["triangulation"])
+    ax.set_ylabel("Ошибка относительно CSV цели, м")
+    ax.set_xlabel("Кадр видео")
+    ax.set_ylim(0, None)
+    ax.set_title(f"Ошибка положения по кадрам — {note}")
+    ax.legend(loc="upper left", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out / "01_error_by_method.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    gt = c["gt"] / upm
+    ax.plot(gt[:, 0], gt[:, 1], color=INK_2, lw=2, label="цель (CSV)")
+    for name in ("center", "cab"):
+        p = c["series"][name]["points"] / upm
+        ax.plot(p[:, 0], p[:, 1], color=METHOD_COLORS[name], lw=2, label=METHOD_NAMES[name])
+    ax.set_aspect("equal")
+    ax.set_xlabel("X, м")
+    ax.set_ylabel("Y, м")
+    ax.set_title("Траектория, вид сверху")
+    ax.legend(loc="best", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out / "02_trajectory_top.png")
+    plt.close(fig)
+
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(12, 6.5), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
+    a1.plot(frames, c["gt_speed"], color=INK_2, lw=2, label="цель (CSV)")
+    for name in ("center", "cab"):
+        a1.plot(frames, c["series"][name]["speed"], color=METHOD_COLORS[name], lw=1.8, label=METHOD_NAMES[name])
+        a2.plot(frames, c["series"][name]["speed"] - c["gt_speed"], color=METHOD_COLORS[name], lw=1.5)
+    a2.axhline(0, color=MUTED, lw=1)
+    a1.set_ylabel("Скорость, м/с")
+    a2.set_ylabel("Разница, м/с")
+    a2.set_xlabel("Кадр видео")
+    a1.set_title("Скорость из производной сплайна")
+    a1.legend(loc="upper left", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out / "03_speed.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(11, 4.2))
+    names = list(METHOD_NAMES)
+    x = np.arange(len(names))
+    med = [c["metrics"][n]["position_m"]["median"] for n in names]
+    p95 = [c["metrics"][n]["position_m"]["p95"] for n in names]
+    ax.bar(x - 0.18, med, width=0.34, color=BLUE, label="медиана")
+    ax.bar(x + 0.18, p95, width=0.34, color=YELLOW, label="p95")
+    for xi, v in zip(x - 0.18, med):
+        ax.annotate(f"{v:.1f}", (xi, v), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9, color=INK_2)
+    for xi, v in zip(x + 0.18, p95):
+        ax.annotate(f"{v:.1f}", (xi, v), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9, color=INK_2)
+    ax.set_xticks(x, [METHOD_NAMES[n].replace(": ", ":\n") for n in names], fontsize=9)
+    ax.set_ylabel("Ошибка, м")
+    ax.set_title("Сравнение вариантов относительно CSV цели")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(out / "04_methods_summary.png")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    obs = cab["observations"]
+    data, labels = [], []
+    for cam in CAMERAS:
+        e = cab["edge_errors_px"][obs.camera_indices[(obs.times >= cab["trajectory"].t_start)
+                                                     & (obs.times <= cab["trajectory"].t_end)] == cam]
+        e = e[np.isfinite(e)]
+        data.append(e)
+        labels.append(f"Cam{cam}\nn={len(e)}")
+    bp = ax.boxplot(data, tick_labels=labels, showfliers=False, patch_artist=True, widths=0.5)
+    for patch, cam in zip(bp["boxes"], CAMERAS):
+        patch.set_facecolor(CAMERA_COLORS[cam])
+        patch.set_alpha(0.8)
+    ax.set_ylabel("Пиксели")
+    ax.set_title("Рёбра рамки коробки против рамки детектора")
+    fig.tight_layout()
+    fig.savefig(out / "05_cab_edge_errors.png")
+    plt.close(fig)
+
+
+def _fmt(s: dict) -> str:
+    if not s or not s.get("n"):
+        return "—"
+    return f"{s['median']:.2f} / {s['p95']:.2f} / {s['rmse']:.2f} / {s['max']:.2f}"
+
+
+def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
+    d = cab["dimensions"]
+    upm = args.units_per_meter
+    lines = [
+        "# Траектория грузовика: точка кабины",
+        "",
+        "> ⚠️ Детектор YOLO дообучен на этих же видео: качество детекции оценено на обучающих данных.",
+        "",
+        f"Основной результат — **{METHOD_NAMES[MAIN_METHOD]}**. Веса: `{args.weights}`, смещение кадров: {args.frame_offset}.",
+        "",
+        "Испорченные ячейки CSV цели (исключены из оценки): " + ("; ".join(c["target_issues"]) or "нет"),
+        "",
+        f"Габариты коробки: {d.length / upm:.2f} × {d.width / upm:.2f} × {d.height / upm:.2f} м "
+        f"({'фиксированы' if args.fixed_dimensions else 'подобраны по рамкам'}; "
+        "это «эффективная» коробка для рамок детектора, а не реальный размер грузовика). "
+        f"Оптимизация: {'сошлась' if cab['converged'] else 'не сошлась'}, итераций {cab['nfev']}.",
+        "",
+        "## Сравнение с CSV цели, м (медиана / p95 / RMSE / максимум)",
+        "",
+        "| Вариант | кадров | ошибка положения | без постоянного смещения | смещение вдоль / поперёк / верт., м "
+        "| макс. скорость, м/с | ошибка скорости, медиана / p95, м/с | макс. ускорение, м/с² | путь, м (цель) |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for name, m in metrics.items():
+        b = m["bias_m"]
+        k = m.get("kinematics")
+        kin = (f"{k['speed_max_mps']:.1f} | {k['speed_error_mps']['median']:.2f} / {k['speed_error_mps']['p95']:.2f} "
+               f"| {k['accel_max_mps2']:.1f} | {k['path_m']:.0f} ({k['target_path_m']:.0f})") if k else "— | — | — | —"
+        title = f"**{METHOD_NAMES[name]}**" if name == MAIN_METHOD else METHOD_NAMES[name]
+        lines.append(f"| {title} | {m['frames']} | {_fmt(m['position_m'])} | {_fmt(m['position_without_bias_m'])} "
+                     f"| {b['along_m']:+.2f} / {b['cross_m']:+.2f} / {b['vertical_m']:+.2f} | {kin} |")
+    lines += ["", "Скорость цели по CSV: максимум ≈ 32 м/с.", "",
+              "## Кабина по числу камер с детекцией на кадре, м", "",
+              "| камер | кадров | медиана | p95 | максимум |", "|---|---|---|---|---|"]
+    for k, s in metrics[MAIN_METHOD]["by_detected_cameras"].items():
+        lines.append(f"| {k} | {s['n']} | {s['median']:.2f} | {s['p95']:.2f} | {s['max']:.2f} |")
+    gaps = [(a, b) for a, b in find_gaps(c["detected_cams"] > 0) if b - a >= 2]
+    lines += ["", "Кадры без единой детекции (≥3 подряд): " + (", ".join(f"{a}–{b}" for a, b in gaps) or "нет"), "",
+              "## Графики", ""]
+    lines += [f"![{p.stem}](compare/{p.name})" for p in sorted((args.out / "compare").glob("*.png"))]
+    lines += ["", "Отчёт базового варианта (центр маски): [center/report.md](center/report.md)"]
+    (args.out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------- видео
+
+_BOX_EDGES = [(a, b) for a in range(8) for b in range(a + 1, 8) if bin(a ^ b).count("1") == 1]
+
+
+def render_videos(args, detections, cab: dict, c: dict) -> None:
+    import cv2
+
+    out_dir = args.out / "videos"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    traj, dims = cab["trajectory"], cab["dimensions"].as_array()
+    frames = c["frames"]
+    span = (frames >= traj.t_start) & (frames <= traj.t_end)
+    pts = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
+    vel = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
+    pts[span] = traj.evaluate(frames[span].astype(float))
+    vel[span] = traj.derivative().evaluate(frames[span].astype(float))
+    corners = np.full((NUM_VIDEO_FRAMES, 8, 3), np.nan)
+    corners[span] = box_corners(pts[span], vel[span], dims)
+    speed = c["series"]["cab"]["speed"]
+    err = c["series"]["cab"]["error"]
+    upm = args.units_per_meter
+
+    def bgr(h):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i + 2], 16) for i in (4, 2, 0))
+
+    for cam in CAMERAS:
+        cap = cv2.VideoCapture(str(video_path(args.data, cam)))
+        target_file = out_dir / f"cab_cam{cam}.mp4"
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{IMAGE_WIDTH}x{IMAGE_HEIGHT}",
+             "-r", str(args.fps), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+             "-pix_fmt", "yuv420p", str(target_file)], stdin=subprocess.PIPE)
+        for f in range(NUM_VIDEO_FRAMES):
+            ok, img = cap.read()
+            if not ok:
+                break
+            camera = make_camera(args.data, cam, f + args.frame_offset)
+            d = detections[cam].get(f)
+            if d is not None:
+                cv2.rectangle(img, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), bgr(MUTED), 1, cv2.LINE_AA)
+            if span[f]:
+                box = camera.project(corners[f])
+                for a, b in _BOX_EDGES:
+                    if np.all(np.isfinite(box[[a, b]])):
+                        cv2.line(img, tuple(box[a].astype(int)), tuple(box[b].astype(int)), bgr(BLUE), 2, cv2.LINE_AA)
+                trail = camera.project(pts[max(0, f - 90):f + 1])
+                trail = trail[np.all(np.isfinite(trail), axis=1)].astype(np.int32)
+                if len(trail) > 1:
+                    cv2.polylines(img, [trail], False, bgr(YELLOW), 2, cv2.LINE_AA)
+                p = camera.project(pts[f])
+                if np.all(np.isfinite(p)):
+                    cv2.circle(img, (int(p[0]), int(p[1])), 8, bgr(YELLOW), 3, cv2.LINE_AA)
+            if c["gt_valid"][f]:
+                g = camera.project(c["gt"][f])
+                if np.all(np.isfinite(g)):
+                    cv2.drawMarker(img, (int(g[0]), int(g[1])), bgr(AQUA), cv2.MARKER_DIAMOND, 14, 2, cv2.LINE_AA)
+            n = int(c["detected_cams"][f])
+            lines = [f"Cam{cam}  frame {f}  CAB POINT"]
+            if span[f]:
+                q = pts[f] / upm
+                lines += [f"X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} m",
+                          f"speed {speed[f]:.1f} m/s ({speed[f] * 3.6:.0f} km/h)",
+                          f"MEASURED ({n} cams)" if n else "SPLINE ONLY"]
+                if np.isfinite(err[f]):
+                    lines.append(f"error vs target {err[f]:.2f} m")
+            else:
+                lines.append("outside spline range")
+            lines.append("YOLO trained on these videos")
+            cv2.rectangle(img, (10, 10), (480, 20 + 30 * len(lines)), (20, 20, 20), -1)
+            for i, text in enumerate(lines):
+                color = bgr(ORANGE) if text.startswith("SPLINE ONLY") else (255, 255, 255)
+                cv2.putText(img, text, (20, 38 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+            legend = [("truck box (fitted)", BLUE), ("cab point + trail", YELLOW), ("detector box", MUTED),
+                      ("target CSV", AQUA)]
+            for i, (text, col) in enumerate(legend):
+                y = IMAGE_HEIGHT - 20 - 26 * (len(legend) - 1 - i)
+                cv2.rectangle(img, (16, y - 12), (32, y + 2), bgr(col), -1)
+                cv2.putText(img, text, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+            ffmpeg.stdin.write(img.tobytes())
+        cap.release()
+        ffmpeg.stdin.close()
+        ffmpeg.wait()
+        log.info("видео: %s", target_file)
+
+
+# ---------------------------------------------------------------- запуск
+
+def run(args) -> None:
+    setup_logging(args.out)
+    steps = [s.strip() for s in args.steps.split(",") if s.strip()]
+    if args.video and "video" not in steps:
+        steps.append("video")
+    unknown = set(steps) - set(ALL_STEPS) - {"video"}
+    if unknown:
+        raise SystemExit(f"Неизвестные шаги: {', '.join(sorted(unknown))}. Доступны: {', '.join(ALL_STEPS)}, video")
+    log.info("шаги: %s", ", ".join(steps))
+
+    if "detect" in steps:
+        run_detection(args)
+    detections = load_detections(args.out)
+
+    needs_center = any(s in steps for s in ("center", "optimize", "cab", "compare", "video"))
+    center_result = step_center(args, detections) if needs_center else None
+    center = center_result["spline"] if center_result else None
+
+    optimized = None
+    if "optimize" in steps:
+        optimized = step_optimize(args, detections, center)
+    elif (args.out / "optimized_spline.npz").exists():
+        optimized = load_spline(args.out / "optimized_spline.npz")
+
+    cab = None
+    if "cab" in steps:
+        cab = step_cab(args, detections, center)
+    elif (args.out / "cab_spline.npz").exists() and any(s in steps for s in ("compare", "video")):
+        data = np.load(args.out / "cab_spline.npz")
+        observations = BoxObservations.from_detections([d for cam in detections.values() for d in cam.values()],
+                                                       frame_offset=args.frame_offset)
+        cab = {"trajectory": load_spline(args.out / "cab_spline.npz"), "dimensions": TruckDimensions(*data["dimensions"]),
+               "edge_errors_px": np.full((len(observations.times), 4), np.nan), "converged": False, "nfev": 0,
+               "observations": observations}
+
+    if "compare" in steps or "video" in steps:
+        if cab is None or optimized is None:
+            raise SystemExit("Для compare/video нужны результаты шагов optimize и cab")
+        metrics, ctx = evaluate_methods(args, detections, center_result, optimized, cab)
+        ctx["metrics"] = metrics
+        if "compare" in steps:
+            (args.out / "compare").mkdir(parents=True, exist_ok=True)
+            plot_comparison(args.out / "compare", ctx, cab, args)
+            write_report(args, metrics, cab, ctx)
+            (args.out / "metrics.json").write_text(json.dumps(
+                {"main_method": MAIN_METHOD, "dimensions_m": (cab["dimensions"].as_array() / args.units_per_meter).tolist(),
+                 "methods": metrics}, ensure_ascii=False, indent=2))
+            log.info("отчёт: %s", args.out / "report.md")
+        if "video" in steps:
+            render_videos(args, detections, cab, ctx)
+
+
+def build_main_parser() -> argparse.ArgumentParser:
+    return add_arguments(build_parser(__doc__))
