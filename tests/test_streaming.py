@@ -60,6 +60,7 @@ def base_config(**over) -> StreamConfig:
     cfg.streaming.log_every = 0
     cfg.spline.background = False
     cfg.tracker.edge_sigma_px = 2.0
+    cfg.tracker.truck_fbx = "models/NO_SUCH_MODEL.fbx"   # синтетика — коробка: реальный FBX из models/ не подхватывать
     cfg.output.performance_report = True
     for k, v in over.items():
         section, key = k.split(".")
@@ -122,13 +123,36 @@ def test_loss_and_reappearance_statuses(tmp_path):
 def test_synchronizer_excludes_desynchronized_camera(tmp_path):
     table = make_table(seed=4)
     pipe = run_pipeline(base_config(**{"streaming.sync_tolerance_ms": 20.0}), table, tmp_path,
-                        source_delays={1: 2})           # камера 1 отстаёт на 2 кадра (67 мс)
-    excluded = sum(1 in r.excluded for r in pipe.records)
-    assert excluded > NUM * 0.8
+                        source_delays={1: 2})           # метки камеры 1 на 2 кадра (67 мс) впереди остальных
+    excluded = [r.index for r in pipe.records if 1 in r.excluded]
+    # кадр «из будущего» исключается из связки, пока остальные камеры не дойдут до его метки (2 тика),
+    # дальше камера стыкуется по меткам и больше не исключается; её кадры при этом не теряются
+    assert excluded and max(excluded) <= 2
     assert all(1 not in r.detected_cameras for r in pipe.records if 1 in r.excluded)
+    assert sum(1 in r.detected_cameras for r in pipe.records) >= NUM - 3
     ok = run_pipeline(base_config(**{"streaming.sync_tolerance_ms": 80.0}), table, tmp_path / "tol",
                       source_delays={1: 2})
     assert sum(1 in r.excluded for r in ok.records) == 0
+
+
+def test_synchronizer_keeps_future_frame_for_next_tick():
+    """Камера, ушедшая на кадр вперёд (разный старт источников), на следующем тике стыкуется, а не
+    теряет отложенный кадр и не остаётся впереди навсегда (ошибка, найденная на реальном replay)."""
+    a, b = FrameSource(1, queue_size=4, lossless=True), FrameSource(2, queue_size=4, lossless=True)
+    img = np.zeros((2, 2, 3), np.uint8)
+    for i in (1, 2, 3):                          # камера 1 стартовала раньше: кадр 0 уже ушёл в одиночную связку
+        a.push(Frame(1, i, i / FPS, img, time.perf_counter()))
+    for i in (0, 1, 2, 3):
+        b.push(Frame(2, i, i / FPS, img, time.perf_counter()))
+    sync = Synchronizer({1: a, 2: b}, FPS, tolerance_s=0.02, max_age_s=0.15, wait_s=0.05)
+    first = sync.next_bundle()
+    assert first.index == 0 and set(first.frames) == {2} and 1 in first.excluded
+    for expected in (1, 2, 3):
+        bundle = sync.next_bundle()
+        assert bundle.index == expected and set(bundle.frames) == {1, 2} and not bundle.excluded
+        assert {f.index for f in bundle.frames.values()} == {expected}
+    a.done = b.done = True
+    assert sync.next_bundle() is None
 
 
 def test_frame_source_drops_old_frames_when_not_lossless():

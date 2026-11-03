@@ -224,14 +224,24 @@ class Synchronizer:
     def all_done(self) -> bool:
         return all(s.done and not s.queue for s in self.sources.values()) and not self._pending
 
+    def _stale(self, frame: Frame, src: FrameSource) -> bool:
+        """Отложенный кадр живого потока старше max_age — вытеснен, как и в pop_latest."""
+        return (not src.lossless and frame.image is not None
+                and time.perf_counter() - frame.captured_at > self.max_age)
+
     def next_bundle(self) -> Bundle | None:
         # подтянуть новые кадры
         deadline = time.perf_counter() + self.wait_s
         while True:
             for cam, src in self.sources.items():
+                kept = self._pending.get(cam)
+                if kept is not None and not self._stale(kept, src):
+                    continue                     # отложенный кадр из будущего ждёт своего тика, новый не снимаем
                 f = src.pop_latest(self.max_age)
                 if f is not None:
                     self._pending[cam] = f
+                elif kept is not None:
+                    self._pending.pop(cam, None)  # отложенный устарел, нового нет
             if self._pending:
                 break
             if self.all_done():
@@ -446,8 +456,8 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
 
 
 def load_truck_model(cfg: StreamConfig) -> TruckModel | None:
-    path = Path(cfg.tracker.truck_fbx)
-    if path.exists():
+    path = Path(cfg.tracker.truck_fbx) if cfg.tracker.truck_fbx else None
+    if path is not None and path.is_file():
         return TruckModel.from_fbx(path, scale=cfg.tracker.truck_scale)
     log.warning("3D-модели %s нет — коробка %.1f × %.2f × %.1f м", path, cfg.tracker.box_length_m,
                 cfg.tracker.box_width_m, cfg.tracker.box_height_m)

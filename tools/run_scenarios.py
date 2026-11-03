@@ -53,6 +53,8 @@ def main(argv=None) -> None:
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
     base = StreamConfig.load(args.config, args.set)
+    if not any(s.startswith("tracker.truck_fbx") for s in args.set):
+        base.tracker.truck_fbx = ""          # синтетика — коробка: реальный FBX из models/ не подхватывать
     keys = args.variants.split(",")
     table = {}
     for name in args.scenarios.split(","):

@@ -104,7 +104,7 @@
     "background": true
   },
   "output": {
-    "out_dir": "outputs/stream",
+    "out_dir": "outputs\\stream",
     "video": true,
     "video_cameras": [],
     "plots": true,
