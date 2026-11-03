@@ -56,7 +56,7 @@ python3 -m venv .venv
 | `optimize` | Офлайн. Контрольные точки сплайна центра маски по пикселям всех камер (least_squares, Huber, ускорение и рывок) | `reconstruction/optimizer.py` | `optimized_spline.npz` |
 | `cab` | Офлайн. Коробка с подбираемыми габаритами по рамкам всего видео; точка — передняя грань / центр кабины | `reconstruction/cab_model.py` | `cab_spline.npz`, `cab_center_spline.npz` |
 | `realtime` | **Основной.** Фильтр Калмана по кадрам, только прошлое; измерение — рамка проекции 3D-модели; обработка потери видимости | `reconstruction/visibility.py`, `truck_model.py` | `realtime_track.npz` |
-| `compare` | Все варианты против CSV цели: положение, смещение в осях грузовика, скорость, скачки скорости, ошибка по числу камер | `pipeline/run.py` | `report.md`, `metrics.json`, `compare/*.png` |
+| `compare` | Все варианты против CSV цели: положение, смещение в осях грузовика, скорость, скачки скорости, ошибка по числу камер; вид сверху с полями зрения камер и участками, где грузовик загорожен (`compare/06_camera_coverage_top.png`) | `pipeline/run.py` | `report.md`, `metrics.json`, `compare/*.png` |
 | `video` (`--video`) | Наложение на каждое видео: силуэт модели, центр кабины, след (только прошлое), статус кадра | `pipeline/run.py` | `videos/realtime_cam{N}.mp4` |
 
 `center` выполняется всегда, когда нужны `optimize`, `cab`, `compare` или `video`: его сплайн — начальное
