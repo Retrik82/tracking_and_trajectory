@@ -9,11 +9,16 @@
   cab       офлайн: модель коробки, подогнанная ко всем рамкам всего видео      reconstruction/cab_model.py
   realtime  ОСНОВНОЙ: трекер реального времени (только прошлые и текущий кадры)
             с 3D-моделью грузовика и обработкой потери видимости             reconstruction/visibility.py
-  compare   все варианты против CSV цели: <out>/report.md, metrics.json, compare/*.png
-  video     видео с силуэтом модели и точкой кабины трекера: <out>/videos (флаг --video)
+  approx    базовый вариант: «обычная аппроксимация» 3D-точек триангуляции полиномом
+            (причинный по окну — реальное время; глобальный — офлайн)       reconstruction/approximation.py
+  compare   все варианты против CSV цели: <out>/report.md, metrics.json, metrics_summary.csv,
+            compare/*.png, сводка в консоль
+  video     видео с силуэтом модели и точкой кабины трекера: <out>/videos (по умолчанию включено,
+            --no-video чтобы пропустить)
 
 center, optimize и cab обрабатывают весь видеоряд сразу (используют будущие кадры) и нужны
-только для сравнения. center при этом нужен всегда: его сплайн — начальное приближение для cab.
+только для сравнения. center при этом нужен всегда: его сплайн — начальное приближение для cab,
+а его 3D-точки — вход для approx.
 """
 
 import argparse
@@ -27,11 +32,12 @@ from pathlib import Path
 import numpy as np
 
 from pipeline.center import (
-    AQUA, BLUE, CAMERA_COLORS, CAMERAS, INK_2, MAGENTA, MUTED, NUM_VIDEO_FRAMES, ORANGE, YELLOW,
-    _style, debiased_norm, find_gaps, run_evaluation, stats, truck_frame_components,
+    AQUA, BLUE, CAMERA_COLORS, CAMERAS, GRID, INK, INK_2, MAGENTA, MUTED, NUM_VIDEO_FRAMES, ORANGE, YELLOW,
+    _style, debiased_norm, find_gaps, run_evaluation, set_cameras, stats, truck_frame_components,
 )
 from pipeline.coverage import plot_camera_coverage
 from pipeline.detect import load_detections, run_detection
+from reconstruction.approximation import causal_polynomial, global_polynomial
 from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
 from reconstruction.cab_model import (
     CAB_CENTER_BACK,
@@ -52,19 +58,23 @@ from reconstruction.truck_model import SCENE_SCALE, TruckModel
 from reconstruction.visibility import INITIALIZING, MEASURED, PARTIAL, PREDICTED, TrackerSettings, run_tracker
 
 log = logging.getLogger("peleng")
-ALL_STEPS = ["detect", "center", "optimize", "cab", "realtime", "compare"]
+ALL_STEPS = ["detect", "center", "optimize", "cab", "realtime", "approx", "compare"]
 MAIN_METHOD = "realtime"
+PURPLE, BROWN = "#7b5cd6", "#a0522d"
 METHOD_NAMES = {
     "triangulation": "Офлайн. Центр маски: триангуляция",
     "center": "Офлайн. Центр маски: начальный сплайн",
+    "approx_poly": "Офлайн. Центр маски: полином по всем 3D-точкам",
     "optimized": "Офлайн. Центр маски: оптимизация по пикселям",
     "cab": "Офлайн. Кабина: низ передней грани",
     "cab_center": "Офлайн. Кабина: центр кабины",
+    "approx_rt": "Реальное время: полином по окну на 3D-точках",
     "realtime_ref": "Реальное время: низ передней грани",      # с 3D-моделью — «точка CSV цели на модели»
     "realtime": "Реальное время: центр кабины (основной)",
 }
-METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "optimized": MAGENTA, "cab": INK_2, "cab_center": AQUA,
-                 "realtime_ref": YELLOW, "realtime": BLUE}
+METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "approx_poly": BROWN, "optimized": MAGENTA, "cab": INK_2,
+                 "cab_center": AQUA, "approx_rt": PURPLE, "realtime_ref": YELLOW, "realtime": BLUE}
+REALTIME_METHODS = ("approx_rt", "realtime_ref", "realtime")
 
 
 def build_main_parser() -> argparse.ArgumentParser:
@@ -73,7 +83,10 @@ def build_main_parser() -> argparse.ArgumentParser:
     p.add_argument("--data", type=Path, default=Path("tmp/project2"), help="папка с видео и CSV")
     p.add_argument("--out", type=Path, default=Path("outputs/main"))
     p.add_argument("--steps", default=",".join(ALL_STEPS), help=f"через запятую из: {', '.join(ALL_STEPS)}")
-    p.add_argument("--video", action="store_true", help="добавить шаг video")
+    p.add_argument("--video", action="store_true", help="добавить шаг video (при --steps)")
+    p.add_argument("--no-video", action="store_true", help="не делать видео при полном прогоне")
+    p.add_argument("--cameras", default=None,
+                   help="номера камер через запятую (по умолчанию 1,2,3,4,5): файлы ...CineCameraActor{N}")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--units-per-meter", type=float, default=100.0, help="единиц мира в метре (Unreal: см)")
     p.add_argument("--frame-offset", type=int, default=0, help="кадр CSV = кадр видео + смещение")
@@ -109,6 +122,15 @@ def build_main_parser() -> argparse.ArgumentParser:
                    help="коробка: центр кабины на столько назад от передней грани, ед. мира")
     g.add_argument("--cab-center-up", type=float, default=CAB_CENTER_UP,
                    help="коробка: центр кабины на столько выше низа передней грани, ед. мира")
+
+    g = p.add_argument_group("approx (обычная аппроксимация 3D-точек)")
+    g.add_argument("--approx-window", type=int, default=15, help="окно причинного полинома, кадров")
+    g.add_argument("--approx-degree", type=int, default=2, help="степень причинного полинома")
+    g.add_argument("--approx-min-points", type=int, default=8, help="минимум точек в окне")
+    g.add_argument("--approx-max-extrapolation", type=int, default=30,
+                   help="сколько кадров держать прогноз без точек")
+    g.add_argument("--approx-huber", type=float, default=100.0, help="порог Хьюбера, ед. мира")
+    g.add_argument("--approx-poly-degree", type=int, default=8, help="степень офлайн-полинома по всем точкам")
     return p
 
 
@@ -230,9 +252,42 @@ def step_realtime(args, detections) -> dict:
     return {"result": result, "dimensions": dims, "model": model, "ms_per_frame": elapsed / NUM_VIDEO_FRAMES * 1000}
 
 
+def step_approx(args, center_result) -> dict:
+    """
+    Базовый вариант без модели объекта: полином по 3D-точкам триангуляции центров масок.
+    Причинный (по окну прошлых кадров) — реальное время; глобальный — офлайн.
+    """
+    ctx = center_result["ctx"]
+    frames = ctx["frames"].astype(float)
+    points = np.where(ctx["ok"][:, None], ctx["tri_points"], np.nan)
+    started = time.time()
+    rt = causal_polynomial(frames, points, window=args.approx_window, degree=args.approx_degree,
+                           min_points=args.approx_min_points, max_extrapolation=args.approx_max_extrapolation,
+                           huber_scale=args.approx_huber)
+    ms_per_frame = (time.time() - started) / len(frames) * 1000
+    poly = global_polynomial(frames, points, degree=args.approx_poly_degree)
+    log.info("аппроксимация: окно %d кадров, степень %d, %.2f мс/кадр; статусы %s; офлайн-полином степени %d",
+             args.approx_window, args.approx_degree, ms_per_frame,
+             {k: int((rt.status == k).sum()) for k in ("measured", "predicted", "none")}, args.approx_poly_degree)
+    np.savez(args.out / "approx_track.npz", frames=frames, rt_points=rt.points, rt_velocity=rt.velocity,
+             rt_status=rt.status, rt_points_used=rt.points_used, poly_points=poly.points, poly_velocity=poly.velocity,
+             window=args.approx_window, degree=args.approx_degree, poly_degree=args.approx_poly_degree)
+    return {"rt": rt, "poly": poly, "ms_per_frame": ms_per_frame}
+
+
 # ---------------------------------------------------------------- сравнение
 
-def evaluate_methods(args, detections, center_result, optimized, cab, realtime) -> tuple[dict, dict]:
+def _axis_metrics(diff_m: np.ndarray, mask: np.ndarray) -> dict:
+    """Ошибка по осям мира X / Y / Z: смещение (среднее), MAE, RMSE, м."""
+    out = {}
+    for i, axis in enumerate("xyz"):
+        d = diff_m[mask, i]
+        out[axis] = {"bias": float(np.mean(d)), "mae": float(np.mean(np.abs(d))),
+                     "rmse": float(np.sqrt(np.mean(d ** 2)))} if len(d) else {}
+    return out
+
+
+def evaluate_methods(args, detections, center_result, optimized, cab, realtime, approx) -> tuple[dict, dict]:
     upm, fps = args.units_per_meter, args.fps
     target = load_target(args.data)
     frames = np.arange(NUM_VIDEO_FRAMES)
@@ -253,27 +308,44 @@ def evaluate_methods(args, detections, center_result, optimized, cab, realtime) 
         series[name] = {"points": np.full((NUM_VIDEO_FRAMES, 3), np.nan), "spline": spline}
         span = (frames >= spline.t_start) & (frames <= spline.t_end)
         series[name]["points"][span] = spline.evaluate(frames[span].astype(float))
+    poly, rt = approx["poly"], approx["rt"]
+    series["approx_poly"] = {"points": poly.points, "spline": None,
+                             "speed": np.linalg.norm(poly.velocity, axis=1) * fps / upm}
+    series["approx_rt"] = {"points": rt.points, "spline": None, "speed": np.linalg.norm(rt.velocity, axis=1) * fps / upm,
+                           "status": rt.status}
     track = realtime["result"]
     rt_speed = track.array("speed_mps")
-    series["realtime_ref"] = {"points": track.array("position"), "spline": None, "speed": rt_speed}
-    series["realtime"] = {"points": track.array("cab_center"), "spline": None, "speed": rt_speed}
+    rt_status = track.array("status")
+    series["realtime_ref"] = {"points": track.array("position"), "spline": None, "speed": rt_speed, "status": rt_status}
+    series["realtime"] = {"points": track.array("cab_center"), "spline": None, "speed": rt_speed, "status": rt_status}
+    # порядок — как в METHOD_NAMES (отчёт, сводка и графики идут в этом порядке)
+    series = {name: series[name] for name in METHOD_NAMES if name in series}
 
     metrics = {}
     for name, s in series.items():
         pts = s["points"]
         has = np.all(np.isfinite(pts), axis=1)
-        err = np.linalg.norm(pts - gt, axis=1) / upm
-        along, cross, vertical = truck_frame_components((pts - gt) / upm, gt_vel)
+        diff_m = (pts - gt) / upm
+        err = np.linalg.norm(diff_m, axis=1)
+        along, cross, vertical = truck_frame_components(diff_m, gt_vel)
         comp_mask = has & gt_valid & moving
         debiased, bias = debiased_norm(along, cross, vertical, comp_mask)
+        evaluated = has & gt_valid
         m = {
-            "frames": int((has & gt_valid).sum()),
-            "position_m": stats(err[has & gt_valid]),
+            "realtime": name in REALTIME_METHODS,
+            "frames": int(evaluated.sum()),
+            "availability": float(has.sum() / NUM_VIDEO_FRAMES),
+            "position_m": stats(err[evaluated]),
+            "position_mae_m": float(np.mean(err[evaluated])) if evaluated.any() else float("nan"),
+            "per_axis_m": _axis_metrics(diff_m, evaluated),
             "bias_m": bias,
             "position_without_bias_m": stats(debiased[comp_mask]),
-            "by_detected_cameras": {int(k): stats(err[has & gt_valid & (detected_cams == k)])
-                                    for k in range(1, 5) if np.any(has & gt_valid & (detected_cams == k))},
+            "by_detected_cameras": {int(k): stats(err[evaluated & (detected_cams == k)])
+                                    for k in range(1, len(CAMERAS) + 1) if np.any(evaluated & (detected_cams == k))},
         }
+        if "status" in s:
+            m["by_status"] = {str(k): stats(err[evaluated & (s["status"] == k)])
+                              for k in np.unique(s["status"]) if np.any(evaluated & (s["status"] == k))}
         if s["spline"] is not None or "speed" in s:
             span = has
             if s["spline"] is not None:
@@ -287,19 +359,37 @@ def evaluate_methods(args, detections, center_result, optimized, cab, realtime) 
             path = float(np.nansum(np.linalg.norm(np.diff(pts[span], axis=0), axis=1)) / upm)
             gt_path = float(np.sum(np.linalg.norm(np.diff(gt_spline.evaluate(csv_t[span]), axis=0), axis=1)) / upm)
             m["kinematics"] = {
-                "speed_max_mps": float(np.nanmax(speed)),
+                "speed_max_mps": float(np.nanmax(speed)) if np.any(np.isfinite(speed)) else float("nan"),
                 "speed_error_mps": stats(np.abs(speed - gt_speed)[span]),
-                "speed_change_max_mps2": float(jumps.max()),
-                "speed_change_p99_mps2": float(np.percentile(jumps, 99)),
+                "speed_change_max_mps2": float(jumps.max()) if len(jumps) else float("nan"),
+                "speed_change_p99_mps2": float(np.percentile(jumps, 99)) if len(jumps) else float("nan"),
                 "path_m": path, "target_path_m": gt_path,
             }
         s["error"] = err
         metrics[name] = m
 
+    # Погрешность трекера: заявленное СКО положения (по горизонтали) против фактической ошибки
+    std_m = track.array("position_std") / upm
+    horiz = np.linalg.norm((track.array("position") - gt)[:, :2], axis=1) / upm
+    ok_std = np.isfinite(std_m) & np.isfinite(horiz) & gt_valid
+    for name in ("realtime_ref", "realtime"):
+        metrics[name]["uncertainty"] = {
+            "position_std_median_m": float(np.median(std_m[ok_std])) if ok_std.any() else float("nan"),
+            "horizontal_error_median_m": float(np.median(horiz[ok_std])) if ok_std.any() else float("nan"),
+            "error_to_std_ratio_median": float(np.median(horiz[ok_std] / np.maximum(std_m[ok_std], 1e-6)))
+            if ok_std.any() else float("nan"),
+            "within_2std_fraction": float(np.mean(horiz[ok_std] <= 2 * std_m[ok_std])) if ok_std.any() else float("nan"),
+            "note": "СКО — по центру модели из ковариации фильтра, ошибка — точки вывода (с ошибкой курса); "
+                    "идеальная калибровка: отношение ~1, в 2σ ~95 %",
+        }
+        metrics[name]["ms_per_frame"] = realtime["ms_per_frame"]
+    metrics["approx_rt"]["ms_per_frame"] = approx["ms_per_frame"]
+
     target_jumps = np.abs(np.diff(gt_speed)) * fps
     ctx_out = dict(frames=frames, gt=gt, gt_valid=gt_valid, gt_speed=gt_speed, series=series,
                    detected_cams=detected_cams, target_issues=target.issues,
-                   target_speed_change_p99=float(np.percentile(target_jumps, 99)), realtime=realtime)
+                   target_speed_change_p99=float(np.percentile(target_jumps, 99)), realtime=realtime, approx=approx,
+                   std_m=std_m, horiz_err_m=horiz)
     return metrics, ctx_out
 
 
@@ -309,7 +399,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     note = "YOLO обучена на этих же видео"
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    for name in ("center", "optimized", "cab_center", "realtime"):
+    for name in ("center", "optimized", "cab_center", "approx_rt", "realtime"):
         ax.plot(frames, c["series"][name]["error"], color=METHOD_COLORS[name], lw=2.5 if name == MAIN_METHOD else 1.5,
                 label=METHOD_NAMES[name])
     ax.scatter(frames, c["series"]["triangulation"]["error"], s=5, color=ORANGE, alpha=0.5, lw=0,
@@ -347,14 +437,14 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     a1.set_ylabel("Скорость, м/с")
     a2.set_ylabel("Разница, м/с")
     a2.set_xlabel("Кадр видео")
-    a1.set_title("Скорость из производной сплайна")
+    a1.set_title("Скорость: офлайн — производная сплайна, реальное время — вектор скорости фильтра")
     a1.legend(loc="upper left", fontsize=9)
     fig.tight_layout()
     fig.savefig(out / "03_speed.png")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(14, 4.6))
-    names = list(METHOD_NAMES)
+    fig, ax = plt.subplots(figsize=(17, 5))
+    names = [n for n in METHOD_NAMES if n in c["metrics"]]
     x = np.arange(len(names))
     med = [c["metrics"][n]["position_m"]["median"] for n in names]
     p95 = [c["metrics"][n]["position_m"]["p95"] for n in names]
@@ -392,6 +482,101 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     ax.set_title("Рёбра рамки коробки против рамки детектора")
     fig.tight_layout()
     fig.savefig(out / "05_cab_edge_errors.png")
+    plt.close(fig)
+
+    # 07. Координаты от времени (ТЗ п.5): X, Y, Z цели и оценок; справа — разность с целью
+    seconds = frames / args.fps
+    shown = ("realtime", "approx_rt", "cab_center")
+    fig, axes = plt.subplots(3, 2, figsize=(16, 9), sharex=True, gridspec_kw={"width_ratios": [3, 2]})
+    for i, axis in enumerate("XYZ"):
+        a_val, a_err = axes[i]
+        a_val.plot(seconds, gt[:, i], color=INK_2, lw=2.2, label="цель (CSV)")
+        for name in shown:
+            p = c["series"][name]["points"] / upm
+            a_val.plot(seconds, p[:, i], color=METHOD_COLORS[name], lw=2.2 if name == MAIN_METHOD else 1.3,
+                       ls="-" if name in REALTIME_METHODS else "--", label=METHOD_NAMES[name])
+            a_err.plot(seconds, p[:, i] - gt[:, i], color=METHOD_COLORS[name],
+                       lw=1.8 if name == MAIN_METHOD else 1.1, ls="-" if name in REALTIME_METHODS else "--")
+        a_err.axhline(0, color=MUTED, lw=1)
+        a_val.set_ylabel(f"{axis}, м")
+        a_err.set_ylabel(f"Δ{axis}, м")
+        lim = np.nanpercentile(np.abs(np.concatenate(
+            [c["series"][n]["points"][:, i] / upm - gt[:, i] for n in shown])), 98)
+        if np.isfinite(lim) and lim > 0:
+            a_err.set_ylim(-1.5 * lim, 1.5 * lim)
+    axes[0, 0].set_title("Координаты от времени: цель и оценки (сплошные — реальное время, пунктир — офлайн)")
+    axes[0, 1].set_title("Разность оценка − цель (обрезано по p98)")
+    axes[0, 0].legend(loc="upper left", fontsize=8, ncol=2)
+    for a in axes[-1]:
+        a.set_xlabel("Время, с")
+    sec = axes[0, 0].secondary_xaxis("top", functions=(lambda s_: s_ * args.fps, lambda f_: f_ / args.fps))
+    sec.set_xlabel("Кадр видео", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out / "07_coordinates_vs_time.png")
+    plt.close(fig)
+
+    # 08. «Обычная аппроксимация» 3D-точек против трекера
+    rt = c["approx"]["rt"]
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(12, 9), gridspec_kw={"height_ratios": [1, 1.3]})
+    a1.scatter(frames, c["series"]["triangulation"]["error"], s=5, color=ORANGE, alpha=0.5, lw=0,
+               label=METHOD_NAMES["triangulation"])
+    for name in ("approx_poly", "center", "approx_rt", "realtime_ref"):
+        a1.plot(frames, c["series"][name]["error"], color=METHOD_COLORS[name], lw=2 if name == "approx_rt" else 1.4,
+                ls="-" if name in REALTIME_METHODS else "--", label=METHOD_NAMES[name])
+    predicted = rt.status == "predicted"
+    for a, b in find_gaps(~predicted):
+        a1.axvspan(a - 0.5, b + 0.5, color=PURPLE, alpha=0.12, lw=0)
+    for a, b in find_gaps(rt.status != "none"):
+        a1.axvspan(a - 0.5, b + 0.5, color=GRID, alpha=0.9, lw=0)
+    a1.set_ylim(0, None)
+    a1.set_ylabel("Ошибка относительно CSV цели, м")
+    a1.set_xlabel("Кадр видео (сиреневым — прогноз полинома без точек, серым — оценки нет)")
+    a1.set_title(f"Аппроксимация 3D-точек полиномом (окно {args.approx_window} кадров, "
+                 f"степень {args.approx_degree}) против модели грузовика — {note}")
+    a1.legend(loc="upper left", fontsize=8)
+    gt_m = gt / upm
+    a2.plot(gt_m[:, 0], gt_m[:, 1], color=INK_2, lw=2.2, label="цель (CSV)")
+    tp = c["series"]["triangulation"]["points"] / upm
+    a2.scatter(tp[:, 0], tp[:, 1], s=6, color=ORANGE, alpha=0.5, lw=0, label="3D-точки (центр маски)")
+    for name in ("approx_poly", "approx_rt", "realtime_ref"):
+        p = c["series"][name]["points"] / upm
+        a2.plot(p[:, 0], p[:, 1], color=METHOD_COLORS[name], lw=1.6, ls="-" if name in REALTIME_METHODS else "--",
+                label=METHOD_NAMES[name])
+    a2.set_aspect("equal")
+    a2.set_xlabel("X, м")
+    a2.set_ylabel("Y, м")
+    a2.set_title("Вид сверху: 3D-точки и их аппроксимации")
+    a2.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out / "08_approximation_vs_tracker.png")
+    plt.close(fig)
+
+    # 09. Погрешность трекера: заявленное СКО против фактической ошибки (ТЗ п.6)
+    track = c["realtime"]["result"]
+    status = track.array("status")
+    std, herr = c["std_m"], c["horiz_err_m"]
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(15, 4.8), gridspec_kw={"width_ratios": [3, 1.2]})
+    a1.fill_between(frames, 0, 2 * std, color=BLUE, alpha=0.15, lw=0, label="2·СКО фильтра (по горизонтали)")
+    a1.plot(frames, herr, color=YELLOW, lw=1.5, label=f"{METHOD_NAMES['realtime_ref']}: ошибка по горизонтали")
+    for code, color in ((PREDICTED, ORANGE), (PARTIAL, MAGENTA)):
+        for a, b in find_gaps(status != code):
+            a1.axvspan(a - 0.5, b + 0.5, color=color, alpha=0.18, lw=0)
+    a1.set_ylim(0, None)
+    a1.set_xlabel("Кадр видео (оранжевым — predicted, розовым — partial)")
+    a1.set_ylabel("м")
+    a1.set_title("Оценка погрешности трекера: фактическая ошибка и заявленная неопределённость")
+    a1.legend(loc="upper left", fontsize=8)
+    ok_std = np.isfinite(std) & np.isfinite(herr)
+    a2.scatter(std[ok_std], herr[ok_std], s=8, color=BLUE, alpha=0.5, lw=0)
+    top = max(np.nanpercentile(std[ok_std], 99), np.nanpercentile(herr[ok_std], 99)) if ok_std.any() else 1
+    a2.plot([0, top], [0, 2 * top], color=MUTED, lw=1, ls="--", label="ошибка = 2·СКО")
+    a2.set_xlim(0, top)
+    a2.set_ylim(0, top * 2)
+    a2.set_xlabel("СКО фильтра, м")
+    a2.set_ylabel("ошибка, м")
+    a2.legend(loc="upper left", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out / "09_realtime_uncertainty.png")
     plt.close(fig)
 
 
@@ -447,8 +632,37 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
     rt = c["realtime"]["result"]
     status = rt.array("status")
     since = rt.array("frames_since_measurement")
-    lines += ["", f"Скорость цели по CSV: максимум ≈ 32 м/с; скачок скорости между кадрами p99 "
+    lines += ["", f"Скорость цели по CSV: максимум {np.nanmax(c['gt_speed']):.1f} м/с; скачок скорости между кадрами p99 "
               f"{c['target_speed_change_p99']:.1f} м/с².", "",
+              "## Ошибка по осям мира, м (смещение / MAE / RMSE)", "",
+              "| Вариант | доля кадров с оценкой | X | Y | Z | MAE 3D |", "|---|---|---|---|---|---|"]
+    for name, m in metrics.items():
+        ax = m["per_axis_m"]
+        cells = " | ".join(f"{ax[a]['bias']:+.2f} / {ax[a]['mae']:.2f} / {ax[a]['rmse']:.2f}" if ax.get(a) else "—"
+                           for a in "xyz")
+        title = f"**{METHOD_NAMES[name]}**" if name == MAIN_METHOD else METHOD_NAMES[name]
+        lines.append(f"| {title} | {m['availability'] * 100:.0f} % | {cells} | {m['position_mae_m']:.2f} |")
+    u = metrics["realtime_ref"]["uncertainty"]
+    lines += ["", "## Оценка погрешности реального времени", "",
+              f"Фильтр заявляет СКО положения по горизонтали: медиана {u['position_std_median_m']:.2f} м; фактическая "
+              f"ошибка по горизонтали ({METHOD_NAMES['realtime_ref']}): медиана {u['horizontal_error_median_m']:.2f} м. "
+              f"Отношение ошибка / СКО: медиана {u['error_to_std_ratio_median']:.1f}; в пределах 2·СКО "
+              f"{u['within_2std_fraction'] * 100:.0f} % кадров (при честной ковариации ~95 %). "
+              "Отношение больше ~2 означает, что ковариация занижена: ошибка курса и несовпадение модели с рамками "
+              "в ней не учтены (см. compare/09_realtime_uncertainty.png).", "",
+              "Ошибка основного варианта по статусу кадра, м (медиана / p95 / RMSE / максимум):", "",
+              "| статус | кадров | ошибка |", "|---|---|---|"]
+    for code, s in metrics[MAIN_METHOD].get("by_status", {}).items():
+        lines.append(f"| {code} | {s['n']} | {_fmt(s)} |")
+    a = c["approx"]
+    lines += ["", "## Базовый вариант: обычная аппроксимация 3D-точек", "",
+              f"Полином степени {args.approx_degree} по окну {args.approx_window} кадров (только прошлое, Хьюбер "
+              f"{args.approx_huber / upm:.1f} м) на точках триангуляции центров масок; без точек — прогноз последним "
+              f"полиномом по прямой до {args.approx_max_extrapolation} кадров; {a['ms_per_frame']:.2f} мс/кадр. "
+              f"Офлайн — один полином степени {args.approx_poly_degree} по всем точкам. "
+              "Оба наследуют смещение центра маски относительно точки CSV (столбец «без постоянного смещения» "
+              "показывает ошибку формы) и скачки при смене камер; у них нет формы грузовика и курса, "
+              "поэтому точку кабины из них получить нельзя. См. compare/08_approximation_vs_tracker.png.", "",
               "## Реальное время: статусы кадров", "",
               f"Время на кадр: {c['realtime']['ms_per_frame']:.1f} мс (вместе с чтением поз камер).", "",
               "| статус | кадров | что значит |", "|---|---|---|",
@@ -467,7 +681,8 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
     lines += ["", "Кадры без единой детекции (≥3 подряд): " + (", ".join(f"{a}–{b}" for a, b in gaps) or "нет"), "",
               "## Графики", ""]
     lines += [f"![{p.stem}](compare/{p.name})" for p in sorted((args.out / "compare").glob("*.png"))]
-    lines += ["", "Отчёт базового варианта (центр маски): [center/report.md](center/report.md)", "",
+    lines += ["", "Отчёт базового варианта (центр маски): [center/report.md](center/report.md); "
+              "сводная таблица: [metrics_summary.csv](metrics_summary.csv)", "",
               "## Известные ограничения реального времени", "",
               "- Курс берётся из направления скорости фильтра. В медленном резком повороте (кадры ~650–850, "
               "~5–6 м/с) он ошибается на десятки градусов, и точка кабины уходит вбок примерно на половину длины.",
@@ -478,6 +693,62 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
               "- Без 3D-модели — коробка 16.5 × 2.55 × 4.0 м (онлайн-уточнение габаритов расходится).",
               "- Пределы ускорения и СКО ребра рамки подобраны под эту сцену (по CSV цели)."]
     (args.out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+SUMMARY_COLUMNS = ["method", "realtime", "frames", "availability", "median_m", "p95_m", "rmse_m", "max_m", "mae_m",
+                   "debiased_median_m", "rmse_x_m", "rmse_y_m", "rmse_z_m", "speed_error_median_mps",
+                   "speed_change_max_mps2", "ms_per_frame"]
+
+
+def summary_rows(metrics: dict) -> list[dict]:
+    """Одна строка на вариант — для CSV и консоли."""
+    rows = []
+    for name, m in metrics.items():
+        p, k, ax = m["position_m"], m.get("kinematics"), m["per_axis_m"]
+        rows.append({
+            "method": METHOD_NAMES[name], "realtime": "да" if m["realtime"] else "офлайн", "frames": m["frames"],
+            "availability": round(m["availability"], 3),
+            "median_m": p.get("median"), "p95_m": p.get("p95"), "rmse_m": p.get("rmse"), "max_m": p.get("max"),
+            "mae_m": m["position_mae_m"], "debiased_median_m": m["position_without_bias_m"].get("median"),
+            "rmse_x_m": ax["x"].get("rmse"), "rmse_y_m": ax["y"].get("rmse"), "rmse_z_m": ax["z"].get("rmse"),
+            "speed_error_median_mps": k["speed_error_mps"].get("median") if k else None,
+            "speed_change_max_mps2": k["speed_change_max_mps2"] if k else None,
+            "ms_per_frame": m.get("ms_per_frame"),
+        })
+    return rows
+
+
+def write_summary_csv(path: Path, metrics: dict) -> None:
+    import csv
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
+        w.writeheader()
+        for row in summary_rows(metrics):
+            w.writerow({k: (f"{v:.3f}" if isinstance(v, float) else v) for k, v in row.items()})
+
+
+def print_summary(metrics: dict, args) -> None:
+    """Сводка метрик качества в консоль (ТЗ п.6): ошибка относительно CSV цели по вариантам."""
+    def num(v, digits=2):
+        return "—" if v is None or (isinstance(v, float) and not np.isfinite(v)) else f"{v:.{digits}f}"
+
+    head = f"{'Вариант':62} {'РВ':6} {'кадров':>6} {'медиана':>8} {'p95':>7} {'RMSE':>7} {'макс':>7} " \
+           f"{'без смещ.':>9} {'σv, м/с':>8} {'Δv макс':>8} {'мс/кадр':>8}"
+    print()
+    print("СВОДКА КАЧЕСТВА: ошибка положения относительно CSV цели, м (YOLO обучена на этих же видео)")
+    print(head)
+    print("-" * len(head))
+    for r in summary_rows(metrics):
+        mark = "*" if r["method"] == METHOD_NAMES[MAIN_METHOD] else " "
+        print(f"{mark}{r['method']:61} {r['realtime']:6} {r['frames']:6d} {num(r['median_m']):>8} {num(r['p95_m']):>7} "
+              f"{num(r['rmse_m']):>7} {num(r['max_m']):>7} {num(r['debiased_median_m']):>9} "
+              f"{num(r['speed_error_median_mps']):>8} {num(r['speed_change_max_mps2'], 1):>8} {num(r['ms_per_frame']):>8}")
+    u = metrics["realtime_ref"].get("uncertainty", {})
+    print(f"* основной результат. Погрешность трекера: СКО {num(u.get('position_std_median_m'))} м, "
+          f"ошибка/СКО {num(u.get('error_to_std_ratio_median'), 1)}, в 2σ {num(u.get('within_2std_fraction', 0) * 100, 0)} %")
+    print(f"Отчёт: {args.out / 'report.md'}; графики: {args.out / 'compare'}; таблица: {args.out / 'metrics_summary.csv'}")
+    print()
 
 
 # ---------------------------------------------------------------- видео
@@ -513,6 +784,9 @@ def render_videos(args, detections, c: dict) -> None:
         return tuple(int(h[i:i + 2], 16) for i in (4, 2, 0))
 
     for cam in CAMERAS:
+        if not video_path(args.data, cam).exists():
+            log.warning("видео: нет файла %s, камера пропущена", video_path(args.data, cam))
+            continue
         cap = cv2.VideoCapture(str(video_path(args.data, cam)))
         target_file = out_dir / f"realtime_cam{cam}.mp4"
         ffmpeg = subprocess.Popen(
@@ -585,13 +859,18 @@ def render_videos(args, detections, c: dict) -> None:
 
 def run(args) -> None:
     setup_logging(args.out)
+    if args.cameras:
+        set_cameras(int(c) for c in args.cameras.split(",") if c.strip())
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
-    if args.video and "video" not in steps:
+    full_run = set(ALL_STEPS) - {"detect"} <= set(steps)       # полный прогон (detect мог быть пропущен)
+    if (args.video or (full_run and not args.no_video)) and "video" not in steps:
         steps.append("video")
+    if args.no_video and "video" in steps:
+        steps.remove("video")
     unknown = set(steps) - set(ALL_STEPS) - {"video"}
     if unknown:
         raise SystemExit(f"Неизвестные шаги: {', '.join(sorted(unknown))}. Доступны: {', '.join(ALL_STEPS)}, video")
-    log.info("шаги: %s", ", ".join(steps))
+    log.info("шаги: %s; камеры: %s", ", ".join(steps), CAMERAS)
 
     if "detect" in steps:
         run_detection(args)
@@ -624,10 +903,14 @@ def run(args) -> None:
     if any(s in steps for s in ("realtime", "compare", "video")):
         realtime = step_realtime(args, detections)
 
+    approx = None
+    if any(s in steps for s in ("approx", "compare", "video")):
+        approx = step_approx(args, center_result)
+
     if "compare" in steps or "video" in steps:
         if cab is None or optimized is None:
             raise SystemExit("Для compare/video нужны результаты шагов optimize и cab")
-        metrics, ctx = evaluate_methods(args, detections, center_result, optimized, cab, realtime)
+        metrics, ctx = evaluate_methods(args, detections, center_result, optimized, cab, realtime, approx)
         ctx["metrics"] = metrics
         if "compare" in steps:
             (args.out / "compare").mkdir(parents=True, exist_ok=True)
@@ -636,7 +919,9 @@ def run(args) -> None:
             write_report(args, metrics, cab, ctx)
             (args.out / "metrics.json").write_text(json.dumps(
                 {"main_method": MAIN_METHOD, "dimensions_m": (cab["dimensions"].as_array() / args.units_per_meter).tolist(),
-                 "methods": metrics}, ensure_ascii=False, indent=2))
+                 "detector_trained_on_these_videos": True, "methods": metrics}, ensure_ascii=False, indent=2))
+            write_summary_csv(args.out / "metrics_summary.csv", metrics)
             log.info("отчёт: %s", args.out / "report.md")
+            print_summary(metrics, args)
         if "video" in steps:
             render_videos(args, detections, ctx)

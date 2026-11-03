@@ -19,9 +19,9 @@ from pathlib import Path
 import numpy as np
 
 from detection.schema import Detection
+from pipeline.center import CAMERAS
 from reconstruction.data_io import video_path
 
-CAMERAS = [1, 2, 3, 4, 5]
 log = logging.getLogger("peleng")
 
 

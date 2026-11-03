@@ -19,8 +19,16 @@ from reconstruction.bspline import fit_initial_bspline
 from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera
 from reconstruction.triangulation import triangulate_robust
 
-CAMERAS = [1, 2, 3, 4, 5]
+CAMERAS = [1, 2, 3, 4, 5]        # список меняется на месте (set_cameras), чтобы все модули видели один объект
 NUM_VIDEO_FRAMES = 1001
+
+
+def set_cameras(ids) -> None:
+    """Задать номера камер (файлы object_transform_CineCameraActor{N}.csv и видео {N}); список общий для всех шагов."""
+    ids = sorted({int(i) for i in ids})
+    if not ids:
+        raise ValueError("Нужна хотя бы одна камера")
+    CAMERAS[:] = ids
 OFFSETS_TO_SCAN = range(-3, 4)
 log = logging.getLogger("peleng")
 
@@ -184,7 +192,7 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
         flags = {"edge_clipped": 0, "too_small": 0, "unreliable": 0}
         for f in frames:
             c = cameras.get(cam, f + offset)
-            uv = c.project(gt[f]) if gt_valid[f] else np.array([np.nan, np.nan])
+            uv = c.project(gt[f]) if gt_valid[f] and c is not None else np.array([np.nan, np.nan])
             visible = bool(np.all(np.isfinite(uv)) and 0 <= uv[0] < IMAGE_WIDTH and 0 <= uv[1] < IMAGE_HEIGHT)
             in_view.append(visible)
             d = detections[cam].get(f)
@@ -257,7 +265,10 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
         for f, d in detections[cam].items():
             if not span[f] or d.unreliable:
                 continue
-            uv = cameras.get(cam, f + offset).project(spline_points[f])
+            c = cameras.get(cam, f + offset)
+            if c is None:
+                continue
+            uv = c.project(spline_points[f])
             errs.append(float(np.hypot(uv[0] - d.point_u, uv[1] - d.point_v)))
         spline_reproj[cam] = stats(errs)
 
@@ -403,7 +414,8 @@ def make_plots(plots: Path, c: dict) -> None:
         for f, d in c["detections"][cam].items():
             if d.unreliable or not c["gt_valid"][f]:
                 continue
-            uv = c["cameras"].get(cam, f + c["offset"]).project(c["gt"][f])
+            cobj = c["cameras"].get(cam, f + c["offset"])
+            uv = cobj.project(c["gt"][f]) if cobj is not None else np.array([np.nan, np.nan])
             if np.all(np.isfinite(uv)):
                 e.append(np.hypot(d.point_u - uv[0], d.point_v - uv[1]))
         data.append(e)

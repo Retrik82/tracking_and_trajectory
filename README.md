@@ -14,17 +14,30 @@ python3 -m venv .venv
 #   -> tmp/project2/ (папка в .gitignore), или укажите --data
 # модели: models/best.pt (YOLO) и models/CargoTruck.fbx (3D-модель), см. models/README.md
 
-.venv/bin/python main.py --video          # полный прогон, ~2 мин (+ ~3.5 мин детекция при первом запуске)
+.venv/bin/python main.py                  # полный прогон со всеми шагами и видео, ~2 мин (+ ~3.5 мин детекция при первом запуске)
+.venv/bin/python main.py --no-video       # то же без видео
 .venv/bin/pytest -q                       # тесты (тесты на реальных данных пропускаются, если данных нет)
 ```
 
 Отдельные шаги переиспользуют результаты с диска:
 
 ```bash
-.venv/bin/python main.py --steps realtime,compare --video   # только трекер, отчёт и видео
-.venv/bin/python main.py --redetect                        # пересчитать детекции (новые веса)
-.venv/bin/python main.py --help                            # все параметры
+.venv/bin/python main.py --steps realtime,approx,compare --video   # трекер, базовая аппроксимация, отчёт, видео
+.venv/bin/python main.py --redetect                               # пересчитать детекции (новые веса)
+.venv/bin/python main.py --cameras 1,2,3                          # произвольный набор камер
+.venv/bin/python main.py --help                                   # все параметры
 ```
+
+Без видео, весов и 3D-модели пайплайн можно проверить на синтетической сцене в формате проекта:
+
+```bash
+python tools/make_synthetic_data.py --data tmp/synthetic --out outputs/synthetic
+python main.py --data tmp/synthetic --out outputs/synthetic --no-video
+```
+
+В конце шага `compare` в консоль печатается сводка метрик по всем вариантам (та же таблица —
+`metrics_summary.csv`). Обзор кода, последовательность действий и предложения по точности —
+[docs/PIPELINE_REVIEW.md](docs/PIPELINE_REVIEW.md).
 
 ## Как обрабатывается видео
 
@@ -56,11 +69,12 @@ python3 -m venv .venv
 | `optimize` | Офлайн. Контрольные точки сплайна центра маски по пикселям всех камер (least_squares, Huber, ускорение и рывок) | `reconstruction/optimizer.py` | `optimized_spline.npz` |
 | `cab` | Офлайн. Коробка с подбираемыми габаритами по рамкам всего видео; точка — передняя грань / центр кабины | `reconstruction/cab_model.py` | `cab_spline.npz`, `cab_center_spline.npz` |
 | `realtime` | **Основной.** Фильтр Калмана по кадрам, только прошлое; измерение — рамка проекции 3D-модели; обработка потери видимости | `reconstruction/visibility.py`, `truck_model.py` | `realtime_track.npz` |
-| `compare` | Все варианты против CSV цели: положение, смещение в осях грузовика, скорость, скачки скорости, ошибка по числу камер; вид сверху: секторы камер, где грузовик загорожен, оценка препятствий по лучам и тень за ними (`compare/06_camera_coverage_top.png`, `pipeline/coverage.py`) | `pipeline/run.py` | `report.md`, `metrics.json`, `compare/*.png` |
-| `video` (`--video`) | Наложение на каждое видео: силуэт модели, центр кабины, след (только прошлое), статус кадра | `pipeline/run.py` | `videos/realtime_cam{N}.mp4` |
+| `approx` | Базовый вариант без модели объекта: «обычная аппроксимация» 3D-точек триангуляции полиномом — причинный по окну прошлых кадров (реальное время; без точек — прогноз по прямой) и один полином по всем точкам (офлайн) | `reconstruction/approximation.py` | `approx_track.npz` |
+| `compare` | Все варианты против CSV цели: положение (медиана/p95/RMSE/макс, MAE, по осям X/Y/Z), смещение в осях грузовика, скорость, скачки скорости, ошибка по числу камер и по статусу кадра, калибровка погрешности трекера (СКО фильтра против ошибки); графики: ошибка по кадрам, вид сверху, скорость, сводка, рёбра, **координаты от времени** (07), **аппроксимация против трекера** (08), **погрешность** (09); вид сверху с секторами камер и препятствиями (`06`, `pipeline/coverage.py`); сводка в консоль | `pipeline/run.py` | `report.md`, `metrics.json`, `metrics_summary.csv`, `compare/*.png` |
+| `video` | Наложение на каждое видео: силуэт модели, центр кабины, след (только прошлое), статус кадра. Включено при полном прогоне (`--no-video` — пропустить), при `--steps` добавляется флагом `--video` | `pipeline/run.py` | `videos/realtime_cam{N}.mp4` |
 
-`center` выполняется всегда, когда нужны `optimize`, `cab`, `compare` или `video`: его сплайн — начальное
-приближение для `cab`, а его метрики входят в сравнение.
+`center` выполняется всегда, когда нужны `optimize`, `cab`, `approx`, `compare` или `video`: его сплайн — начальное
+приближение для `cab`, его 3D-точки — вход `approx`, а его метрики входят в сравнение.
 
 ### Трекер реального времени (`reconstruction/visibility.py`)
 
@@ -87,9 +101,11 @@ python3 -m venv .venv
 ## Файлы
 
 ```
-main.py                     входная точка: аргументы и запуск шагов
+main.py                     итоговая точка входа: по умолчанию все шаги с видео; проверка данных и весов
+docs/PIPELINE_REVIEW.md     обзор кода: последовательность действий, проверка, предложения по ТЗ
+tools/make_synthetic_data.py синтетическая сцена в формате проекта (CSV камер и цели, детекции) для проверки без видео
 pipeline/
-  run.py                    шаги optimize, cab, realtime, compare, video; аргументы командной строки
+  run.py                    шаги optimize, cab, realtime, approx, compare, video; аргументы; сводка метрик
   detect.py                 шаг detect: YOLO по видео -> CSV детекций
   coverage.py               вид сверху: поля зрения, загораживание, препятствия по лучам (space carving)
   center.py                 шаг center: триангуляция центров масок, начальный сплайн, отчёт;
@@ -110,6 +126,7 @@ reconstruction/
   fbx_reader.py             чтение бинарного FBX без внешних библиотек
   truck_model.py            форма грузовика из FBX: оболочка, центр кабины, точка CSV, масштаб сцены
   visibility.py             трекер реального времени с обработкой потери видимости
+  approximation.py          базовый вариант: полином по окну (реальное время) и по всем точкам (офлайн) на 3D-точках
 models/README.md            какие файлы положить в models/
 tests/                      pytest; conftest.py — путь к данным (PELENG_DATA_DIR) и камеры по кадрам
 ```
@@ -125,7 +142,8 @@ tests/                      pytest; conftest.py — путь к данным (PE
 - **Кадры**: видео 1001 кадр, CSV 1002 строки; `--frame-offset` (кадр CSV = кадр видео + смещение),
   по проверке лучшее 0 (0 и +1 на этих данных почти не различаются).
 - **Камеры 1–4 неподвижны**, Camera5 поворачивается по yaw на кадрах 565–960 и проходит ±180°
-  (между 623 и 624) — поза всегда берётся по кадру.
+  (между 623 и 624) — поза всегда берётся по кадру. Номера камер задаются `--cameras` (по умолчанию 1–5);
+  число кадров (1001) и размер кадра пока константы.
 - **Модель камеры**: `fx = focal_mm / 23.76 * 1920`, `fy = focal_mm / 13.365 * 1080`, `cx = 960`, `cy = 540`;
   `u = cx + fx·(d·right)/z`, `v = cy − fy·(d·up)/z`, `z = d·forward`, `d = P − C`.
 - **Детекция** (`detections/cam{N}.csv`, `detection/schema.py`): `camera, frame, confidence, x1..y2,
