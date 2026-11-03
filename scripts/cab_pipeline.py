@@ -6,9 +6,14 @@
   center    базовый вариант по центру маски: триангуляция + начальный B-сплайн (<out>/center);
             он же — начальное приближение для кабины
   optimize  оптимизация сплайна центра маски по пикселям (для сравнения)
-  cab       основной результат: точка кабины по 3D-коробке, подогнанной к рамкам всех камер
+  cab       офлайн: точка кабины по 3D-коробке, подогнанной ко всем рамкам всего видео (для сравнения)
+  realtime  основной результат: трекер реального времени (только прошлые и текущий кадры),
+            обработка заезда за препятствие и потери видимости (reconstruction/visibility.py)
   compare   метрики всех вариантов против CSV цели, графики, report.md
-  video     видео с наложением коробки и траектории кабины (флаг --video)
+  video     видео с наложением коробки и точки кабины трекера реального времени (флаг --video)
+
+Варианты center, optimize и cab используют весь видеоряд сразу (заглядывают вперёд) и
+нужны только для сравнения; в реальном времени работает только realtime.
 """
 
 import argparse
@@ -36,6 +41,7 @@ from reconstruction.cab_model import (
 from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera, video_path
 from reconstruction.objective import ObjectiveData
 from reconstruction.optimizer import optimize_trajectory
+from reconstruction.visibility import INITIALIZING, MEASURED, PARTIAL, PREDICTED, TrackerSettings, run_tracker
 from scripts.yolo_analysis import (
     AQUA, BLUE, INK_2, MAGENTA, MUTED, ORANGE, YELLOW, CAMERA_COLORS, CAMERAS, NUM_VIDEO_FRAMES,
     _style, debiased_norm, find_gaps, run_evaluation, stats, truck_frame_components,
@@ -43,16 +49,19 @@ from scripts.yolo_analysis import (
 from scripts.yolo_eval import build_parser, load_detections, run_detection, setup_logging
 
 log = logging.getLogger("yolo_eval")
-ALL_STEPS = ["detect", "center", "optimize", "cab", "compare"]
-MAIN_METHOD = "cab_center"
+ALL_STEPS = ["detect", "center", "optimize", "cab", "realtime", "compare"]
+MAIN_METHOD = "realtime"
 METHOD_NAMES = {
-    "triangulation": "Центр маски: триангуляция",
-    "center": "Центр маски: начальный сплайн",
-    "optimized": "Центр маски: оптимизация по пикселям",
-    "cab": "Кабина: низ передней грани",
-    "cab_center": "Кабина: центр кабины (основной)",
+    "triangulation": "Офлайн. Центр маски: триангуляция",
+    "center": "Офлайн. Центр маски: начальный сплайн",
+    "optimized": "Офлайн. Центр маски: оптимизация по пикселям",
+    "cab": "Офлайн. Кабина: низ передней грани",
+    "cab_center": "Офлайн. Кабина: центр кабины",
+    "realtime_ref": "Реальное время: низ передней грани",
+    "realtime": "Реальное время: центр кабины (основной)",
 }
-METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "optimized": MAGENTA, "cab": AQUA, "cab_center": BLUE}
+METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "optimized": MAGENTA, "cab": INK_2, "cab_center": AQUA,
+                 "realtime_ref": YELLOW, "realtime": BLUE}
 
 
 def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -143,9 +152,42 @@ def step_cab(args, detections, center: BSplineTrajectory) -> dict:
             "observations": observations}
 
 
+def step_realtime(args, detections) -> dict:
+    """Трекер реального времени: кадры по порядку, на каждом — только прошлое и текущий кадр."""
+    rows = [d for cam in detections.values() for d in cam.values()]
+    observations = BoxObservations.from_detections(rows, width=IMAGE_WIDTH, height=IMAGE_HEIGHT,
+                                                    frame_offset=args.frame_offset)
+    points = {(d.camera, d.frame): (d.point_u, d.point_v) for d in rows}
+    reliable = {(d.camera, d.frame): not d.unreliable for d in rows}
+    settings = TrackerSettings(fps=args.fps, units_per_meter=args.units_per_meter,
+                               cab_center_back=args.cab_center_back, cab_center_up=args.cab_center_up)
+    dims = TruckDimensions(args.truck_length, args.truck_width, args.truck_height)
+    cache: dict = {}
+
+    def provider(cam, frame):
+        if (cam, frame) not in cache:
+            cache[(cam, frame)] = make_camera(args.data, cam, frame)
+        return cache[(cam, frame)]
+
+    started = time.time()
+    result = run_tracker(observations, provider, np.arange(NUM_VIDEO_FRAMES), points, reliable, settings, dims)
+    elapsed = time.time() - started
+    status = result.array("status")
+    log.info("реальное время: %.1f мс/кадр (с чтением поз камер); статусы %s", elapsed / NUM_VIDEO_FRAMES * 1000,
+             {k: int((status == k).sum()) for k in (INITIALIZING, MEASURED, PARTIAL, PREDICTED)})
+    np.savez(args.out / "realtime_track.npz", frames=np.arange(NUM_VIDEO_FRAMES), status=status,
+             reference=result.array("position"), box_center=result.array("box_center"),
+             cab_center=result.array("cab_center"), speed_mps=result.array("speed_mps"),
+             heading=result.array("heading"), position_std=result.array("position_std"),
+             cameras=result.array("cameras"), cameras_used=result.array("cameras_used"),
+             occluded_edges=result.array("occluded_edges"),
+             frames_since_measurement=result.array("frames_since_measurement"))
+    return {"result": result, "dimensions": dims, "ms_per_frame": elapsed / NUM_VIDEO_FRAMES * 1000}
+
+
 # ---------------------------------------------------------------- сравнение
 
-def evaluate_methods(args, detections, center_result, optimized, cab) -> tuple[dict, dict]:
+def evaluate_methods(args, detections, center_result, optimized, cab, realtime) -> tuple[dict, dict]:
     upm, fps = args.units_per_meter, args.fps
     target = load_target(args.data)
     frames = np.arange(NUM_VIDEO_FRAMES)
@@ -166,6 +208,10 @@ def evaluate_methods(args, detections, center_result, optimized, cab) -> tuple[d
         series[name] = {"points": np.full((NUM_VIDEO_FRAMES, 3), np.nan), "spline": spline}
         span = (frames >= spline.t_start) & (frames <= spline.t_end)
         series[name]["points"][span] = spline.evaluate(frames[span].astype(float))
+    track = realtime["result"]
+    rt_speed = track.array("speed_mps")
+    series["realtime_ref"] = {"points": track.array("position"), "spline": None, "speed": rt_speed}
+    series["realtime"] = {"points": track.array("cab_center"), "spline": None, "speed": rt_speed}
 
     metrics = {}
     for name, s in series.items():
@@ -183,28 +229,32 @@ def evaluate_methods(args, detections, center_result, optimized, cab) -> tuple[d
             "by_detected_cameras": {int(k): stats(err[has & gt_valid & (detected_cams == k)])
                                     for k in range(1, 5) if np.any(has & gt_valid & (detected_cams == k))},
         }
-        if s["spline"] is not None:
-            sp = s["spline"]
+        if s["spline"] is not None or "speed" in s:
             span = has
-            vel = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
-            acc = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
-            vel[span] = sp.derivative(1).evaluate(frames[span].astype(float)) * fps / upm
-            acc[span] = sp.derivative(2).evaluate(frames[span].astype(float)) * fps ** 2 / upm
-            speed = np.linalg.norm(vel, axis=1)
-            s["speed"] = speed
-            path = float(np.sum(np.linalg.norm(np.diff(pts[span], axis=0), axis=1)) / upm)
+            if s["spline"] is not None:
+                vel = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
+                vel[span] = s["spline"].derivative(1).evaluate(frames[span].astype(float)) * fps / upm
+                s["speed"] = np.linalg.norm(vel, axis=1)
+            speed = s["speed"]
+            # Одинаковая для всех вариантов мера скачков: изменение скорости между кадрами, м/с²
+            jumps = np.abs(np.diff(speed)) * fps
+            jumps = jumps[np.isfinite(jumps)]
+            path = float(np.nansum(np.linalg.norm(np.diff(pts[span], axis=0), axis=1)) / upm)
             gt_path = float(np.sum(np.linalg.norm(np.diff(gt_spline.evaluate(csv_t[span]), axis=0), axis=1)) / upm)
             m["kinematics"] = {
                 "speed_max_mps": float(np.nanmax(speed)),
                 "speed_error_mps": stats(np.abs(speed - gt_speed)[span]),
-                "accel_max_mps2": float(np.nanmax(np.linalg.norm(acc, axis=1))),
+                "speed_change_max_mps2": float(jumps.max()),
+                "speed_change_p99_mps2": float(np.percentile(jumps, 99)),
                 "path_m": path, "target_path_m": gt_path,
             }
         s["error"] = err
         metrics[name] = m
 
+    target_jumps = np.abs(np.diff(gt_speed)) * fps
     ctx_out = dict(frames=frames, gt=gt, gt_valid=gt_valid, gt_speed=gt_speed, series=series,
-                   detected_cams=detected_cams, target_issues=target.issues)
+                   detected_cams=detected_cams, target_issues=target.issues,
+                   target_speed_change_p99=float(np.percentile(target_jumps, 99)), realtime=realtime)
     return metrics, ctx_out
 
 
@@ -214,7 +264,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     note = "YOLO обучена на этих же видео"
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    for name in ("center", "optimized", "cab", "cab_center"):
+    for name in ("center", "optimized", "cab_center", "realtime"):
         ax.plot(frames, c["series"][name]["error"], color=METHOD_COLORS[name], lw=2.5 if name == MAIN_METHOD else 1.5,
                 label=METHOD_NAMES[name])
     ax.scatter(frames, c["series"]["triangulation"]["error"], s=5, color=ORANGE, alpha=0.5, lw=0,
@@ -231,7 +281,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     fig, ax = plt.subplots(figsize=(11, 6.5))
     gt = c["gt"] / upm
     ax.plot(gt[:, 0], gt[:, 1], color=INK_2, lw=2, label="цель (CSV)")
-    for name in ("center", "cab_center"):
+    for name in ("cab_center", "realtime"):
         p = c["series"][name]["points"] / upm
         ax.plot(p[:, 0], p[:, 1], color=METHOD_COLORS[name], lw=2, label=METHOD_NAMES[name])
     ax.set_aspect("equal")
@@ -245,7 +295,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
 
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(12, 6.5), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     a1.plot(frames, c["gt_speed"], color=INK_2, lw=2, label="цель (CSV)")
-    for name in ("center", "cab_center"):
+    for name in ("cab_center", "realtime"):
         a1.plot(frames, c["series"][name]["speed"], color=METHOD_COLORS[name], lw=1.8, label=METHOD_NAMES[name])
         a2.plot(frames, c["series"][name]["speed"] - c["gt_speed"], color=METHOD_COLORS[name], lw=1.5)
     a2.axhline(0, color=MUTED, lw=1)
@@ -258,7 +308,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     fig.savefig(out / "03_speed.png")
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(12, 4.4))
+    fig, ax = plt.subplots(figsize=(14, 4.6))
     names = list(METHOD_NAMES)
     x = np.arange(len(names))
     med = [c["metrics"][n]["position_m"]["median"] for n in names]
@@ -269,7 +319,7 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
         ax.annotate(f"{v:.1f}", (xi, v), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9, color=INK_2)
     for xi, v in zip(x + 0.18, p95):
         ax.annotate(f"{v:.1f}", (xi, v), xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9, color=INK_2)
-    ax.set_xticks(x, [METHOD_NAMES[n].replace(": ", ":\n") for n in names], fontsize=9)
+    ax.set_xticks(x, [METHOD_NAMES[n].replace(". ", ".\n").replace(": ", ":\n") for n in names], fontsize=8)
     ax.set_ylabel("Ошибка, м")
     ax.set_title("Сравнение вариантов относительно CSV цели")
     ax.legend(loc="upper right")
@@ -311,6 +361,10 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
         "",
         "> ⚠️ Детектор YOLO дообучен на этих же видео: качество детекции оценено на обучающих данных.",
         "",
+        "> Основной результат считается **в реальном времени**: оценка на кадре t использует только кадры ≤ t. "
+        "Варианты с пометкой «Офлайн» обрабатывают весь видеоряд сразу (заглядывают вперёд) и приведены "
+        "только для сравнения.",
+        "",
         f"Основной результат — **{METHOD_NAMES[MAIN_METHOD]}**. Веса: `{args.weights}`, смещение кадров: {args.frame_offset}.",
         "",
         "Испорченные ячейки CSV цели (исключены из оценки): " + ("; ".join(c["target_issues"]) or "нет"),
@@ -329,19 +383,35 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
         "## Сравнение с CSV цели, м (медиана / p95 / RMSE / максимум)",
         "",
         "| Вариант | кадров | ошибка положения | без постоянного смещения | смещение вдоль / поперёк / верт., м "
-        "| макс. скорость, м/с | ошибка скорости, медиана / p95, м/с | макс. ускорение, м/с² | путь, м (цель) |",
+        "| макс. скорость, м/с | ошибка скорости, медиана / p95, м/с | скачок скорости между кадрами, p99 / макс, м/с² "
+        "| путь, м (цель) |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
     for name, m in metrics.items():
         b = m["bias_m"]
         k = m.get("kinematics")
         kin = (f"{k['speed_max_mps']:.1f} | {k['speed_error_mps']['median']:.2f} / {k['speed_error_mps']['p95']:.2f} "
-               f"| {k['accel_max_mps2']:.1f} | {k['path_m']:.0f} ({k['target_path_m']:.0f})") if k else "— | — | — | —"
+               f"| {k['speed_change_p99_mps2']:.1f} / {k['speed_change_max_mps2']:.1f} "
+               f"| {k['path_m']:.0f} ({k['target_path_m']:.0f})") if k else "— | — | — | —"
         title = f"**{METHOD_NAMES[name]}**" if name == MAIN_METHOD else METHOD_NAMES[name]
         lines.append(f"| {title} | {m['frames']} | {_fmt(m['position_m'])} | {_fmt(m['position_without_bias_m'])} "
                      f"| {b['along_m']:+.2f} / {b['cross_m']:+.2f} / {b['vertical_m']:+.2f} | {kin} |")
-    lines += ["", "Скорость цели по CSV: максимум ≈ 32 м/с.", "",
-              "## Кабина по числу камер с детекцией на кадре, м", "",
+    rt = c["realtime"]["result"]
+    status = rt.array("status")
+    since = rt.array("frames_since_measurement")
+    lines += ["", f"Скорость цели по CSV: максимум ≈ 32 м/с; скачок скорости между кадрами p99 "
+              f"{c['target_speed_change_p99']:.1f} м/с².", "",
+              "## Реальное время: статусы кадров", "",
+              f"Время на кадр: {c['realtime']['ms_per_frame']:.1f} мс (вместе с чтением поз камер).", "",
+              "| статус | кадров | что значит |", "|---|---|---|",
+              f"| initializing | {(status == INITIALIZING).sum()} | ещё нет оценки (нужно несколько кадров с ≥2 камерами) |",
+              f"| measured | {(status == MEASURED).sum()} | хотя бы одна камера дала ≥3 ребра рамки |",
+              f"| partial | {(status == PARTIAL).sum()} | детекции есть, но рёбра закрыты препятствием или краем кадра |",
+              f"| predicted | {(status == PREDICTED).sum()} | детекций нет, прогноз по вектору движения |",
+              "",
+              f"Рёбер рамок, признанных закрытыми препятствием: {int(rt.array('occluded_edges').sum())}. "
+              f"Максимум кадров подряд без измерения: {int(since.max())}.", "",
+              "## Основной результат по числу камер с детекцией на кадре, м", "",
               "| камер | кадров | медиана | p95 | максимум |", "|---|---|---|---|---|"]
     for k, s in metrics[MAIN_METHOD]["by_detected_cameras"].items():
         lines.append(f"| {k} | {s['n']} | {s['median']:.2f} | {s['p95']:.2f} | {s['max']:.2f} |")
@@ -349,7 +419,13 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
     lines += ["", "Кадры без единой детекции (≥3 подряд): " + (", ".join(f"{a}–{b}" for a, b in gaps) or "нет"), "",
               "## Графики", ""]
     lines += [f"![{p.stem}](compare/{p.name})" for p in sorted((args.out / "compare").glob("*.png"))]
-    lines += ["", "Отчёт базового варианта (центр маски): [center/report.md](center/report.md)"]
+    lines += ["", "Отчёт базового варианта (центр маски): [center/report.md](center/report.md)", "",
+              "## Известные ограничения реального времени", "",
+              "- Курс берётся из направления скорости фильтра. В медленном резком повороте (кадры ~650–850, "
+              "~5–6 м/с) он ошибается на десятки градусов, и точка кабины уходит вбок примерно на половину длины.",
+              "- Участок, где грузовик видит одна камера (кадры ~200–300), даёт большую ошибку по глубине.",
+              "- Габариты коробки фиксированы (по умолчанию 16.5 × 2.55 × 4.0 м): онлайн-уточнение расходится.",
+              "- Пределы ускорения и СКО ребра рамки подобраны под эту сцену (по CSV цели)."]
     (args.out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -358,23 +434,22 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
 _BOX_EDGES = [(a, b) for a in range(8) for b in range(a + 1, 8) if bin(a ^ b).count("1") == 1]
 
 
-def render_videos(args, detections, cab: dict, c: dict) -> None:
+def render_videos(args, detections, c: dict) -> None:
+    """Видео по трекеру реального времени: на кадре t рисуется только то, что известно к кадру t."""
     import cv2
 
     out_dir = args.out / "videos"
     out_dir.mkdir(parents=True, exist_ok=True)
-    traj, dims = cab["trajectory"], cab["dimensions"].as_array()
-    cab_point = cab["center_trajectory"]
-    frames = c["frames"]
-    span = (frames >= traj.t_start) & (frames <= traj.t_end)
-    pts = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
-    vel = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
-    ref = np.full((NUM_VIDEO_FRAMES, 3), np.nan)
-    ref[span] = traj.evaluate(frames[span].astype(float))
-    vel[span] = traj.derivative().evaluate(frames[span].astype(float))
-    pts[span] = cab_point.evaluate(frames[span].astype(float))
+    track = c["realtime"]["result"]
+    dims = c["realtime"]["dimensions"].as_array()
+    status = track.array("status")
+    ref = track.array("position")
+    pts = track.array("cab_center")
+    heading = track.array("heading")
+    span = np.all(np.isfinite(ref), axis=1)
+    direction = np.c_[np.cos(heading), np.sin(heading), np.zeros(len(heading))]
     corners = np.full((NUM_VIDEO_FRAMES, 8, 3), np.nan)
-    corners[span] = box_corners(ref[span], vel[span], dims)
+    corners[span] = box_corners(ref[span], direction[span], dims)
     speed = c["series"][MAIN_METHOD]["speed"]
     err = c["series"][MAIN_METHOD]["error"]
     upm = args.units_per_meter
@@ -385,7 +460,7 @@ def render_videos(args, detections, cab: dict, c: dict) -> None:
 
     for cam in CAMERAS:
         cap = cv2.VideoCapture(str(video_path(args.data, cam)))
-        target_file = out_dir / f"cab_cam{cam}.mp4"
+        target_file = out_dir / f"realtime_cam{cam}.mp4"
         ffmpeg = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{IMAGE_WIDTH}x{IMAGE_HEIGHT}",
              "-r", str(args.fps), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
@@ -414,23 +489,25 @@ def render_videos(args, detections, cab: dict, c: dict) -> None:
                 g = camera.project(c["gt"][f])
                 if np.all(np.isfinite(g)):
                     cv2.drawMarker(img, (int(g[0]), int(g[1])), bgr(AQUA), cv2.MARKER_DIAMOND, 14, 2, cv2.LINE_AA)
-            n = int(c["detected_cams"][f])
-            lines = [f"Cam{cam}  frame {f}  CAB CENTER"]
+            est = track.estimates[f]
+            lines = [f"Cam{cam}  frame {f}  REAL-TIME CAB CENTER"]
             if span[f]:
                 q = pts[f] / upm
+                label = {MEASURED: f"MEASURED ({est.cameras_used} cams)",
+                         PARTIAL: f"PARTIAL (occluded, {est.occluded_edges} edges)",
+                         PREDICTED: f"PREDICTED ({est.frames_since_measurement} frames)"}[status[f]]
                 lines += [f"X {q[0]:.1f}  Y {q[1]:.1f}  Z {q[2]:.1f} m",
-                          f"speed {speed[f]:.1f} m/s ({speed[f] * 3.6:.0f} km/h)",
-                          f"MEASURED ({n} cams)" if n else "SPLINE ONLY"]
+                          f"speed {speed[f]:.1f} m/s ({speed[f] * 3.6:.0f} km/h)", label]
                 if np.isfinite(err[f]):
                     lines.append(f"error vs target {err[f]:.2f} m")
             else:
-                lines.append("outside spline range")
+                lines.append("initializing")
             lines.append("YOLO trained on these videos")
-            cv2.rectangle(img, (10, 10), (480, 20 + 30 * len(lines)), (20, 20, 20), -1)
+            cv2.rectangle(img, (10, 10), (560, 20 + 30 * len(lines)), (20, 20, 20), -1)
             for i, text in enumerate(lines):
-                color = bgr(ORANGE) if text.startswith("SPLINE ONLY") else (255, 255, 255)
+                color = bgr(ORANGE) if text.startswith(("PREDICTED", "PARTIAL")) else (255, 255, 255)
                 cv2.putText(img, text, (20, 38 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-            legend = [("truck box (fitted)", BLUE), ("cab center + trail", YELLOW), ("detector box", MUTED),
+            legend = [("truck box (tracker)", BLUE), ("cab center + past trail", YELLOW), ("detector box", MUTED),
                       ("target CSV", AQUA)]
             for i, (text, col) in enumerate(legend):
                 y = IMAGE_HEIGHT - 20 - 26 * (len(legend) - 1 - i)
@@ -482,10 +559,14 @@ def run(args) -> None:
                "edge_errors_px": np.full((len(observations.times), 4), np.nan), "converged": False, "nfev": 0,
                "observations": observations}
 
+    realtime = None
+    if any(s in steps for s in ("realtime", "compare", "video")):
+        realtime = step_realtime(args, detections)
+
     if "compare" in steps or "video" in steps:
         if cab is None or optimized is None:
             raise SystemExit("Для compare/video нужны результаты шагов optimize и cab")
-        metrics, ctx = evaluate_methods(args, detections, center_result, optimized, cab)
+        metrics, ctx = evaluate_methods(args, detections, center_result, optimized, cab, realtime)
         ctx["metrics"] = metrics
         if "compare" in steps:
             (args.out / "compare").mkdir(parents=True, exist_ok=True)
@@ -496,7 +577,7 @@ def run(args) -> None:
                  "methods": metrics}, ensure_ascii=False, indent=2))
             log.info("отчёт: %s", args.out / "report.md")
         if "video" in steps:
-            render_videos(args, detections, cab, ctx)
+            render_videos(args, detections, ctx)
 
 
 def build_main_parser() -> argparse.ArgumentParser:
