@@ -1,7 +1,7 @@
 import numpy as np
 import math
 from reconstruction.camera import Camera
-
+import os
 
 # параметры камеры
 focal_length_mm_cam_1 = 35.000
@@ -38,6 +38,13 @@ f_x_5 = (focal_length_mm_cam_5 * width) / matrix_width_mm
 f_y_5 = (focal_length_mm_cam_5 * height) / matrix_height_mm
 
 
+p = r"D:\projects\tracking_and_trajectory\data\object_transform_CineCameraActor1.csv"
+
+print("exists :", os.path.exists(p))
+print("isfile :", os.path.isfile(p))
+print("stat   :", os.stat(p))         # <-- увидите размер, права, тип
+print("os.access:", os.access(p, os.R_OK))
+
 # Передаем ваши f_x, f_y, c_x, c_y напрямую
 cam_1 = Camera.from_csv_frame(
     file_path="D:\projects\tracking_and_trajectory\data\object_transform_CineCameraActor1.csv",
@@ -48,7 +55,7 @@ cam_1 = Camera.from_csv_frame(
 )
 
 for current_frame in range(0, 100):
-    cam_1.update_from_csv_frame(r"data\object_transform_CineCameraActor1.csv", frame_number=current_frame)
+    cam_1.update_from_csv_frame("data\object_transform_CineCameraActor1.csv", frame_number=current_frame)
     print(cam_1.position)
     # Камера сместилась, f_x и f_y не тронуты
         
