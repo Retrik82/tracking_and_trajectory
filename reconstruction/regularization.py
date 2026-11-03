@@ -33,6 +33,34 @@ def trapezoidal_weights(times: np.ndarray) -> np.ndarray:
     return weights
 
 
+def _derivative_residuals(
+    trajectory: BSplineTrajectory,
+    times: np.ndarray,
+    order: int,
+    weight: float,
+) -> np.ndarray:
+    if weight < 0:
+        raise ValueError("weight не может быть отрицательным")
+
+    if trajectory.degree < order:
+        raise ValueError(
+            f"Для производной порядка {order} нужна степень сплайна >= {order}"
+        )
+
+    times = np.asarray(times, dtype=float)
+
+    weights = trapezoidal_weights(times)
+
+    # BSplineTrajectory задан в физическом времени (узлы в тех же единицах,
+    # что и times), поэтому производная берётся напрямую, без нормализации.
+    derivative = trajectory.derivative(order).evaluate(times)
+
+    return (
+        np.sqrt(weight * weights)[:, None]
+        * derivative
+    )
+
+
 def acceleration_residuals(
     trajectory: BSplineTrajectory,
     times: np.ndarray,
@@ -45,37 +73,11 @@ def acceleration_residuals(
 
         weight * integral(||P''(t)||^2 dt)
 
-    Результат имеет размер (N, 3).
+    Единицы P'' — единицы мира / (единица времени сплайна)^2,
+    например см / кадр^2. Результат имеет размер (N, 3).
     """
 
-    if weight < 0:
-        raise ValueError("weight не может быть отрицательным")
-
-    if trajectory.degree < 2:
-        raise ValueError(
-            "Для ускорения нужна степень сплайна >= 2"
-        )
-
-    times = np.asarray(times, dtype=float)
-
-    weights = trapezoidal_weights(times)
-
-    # Производная B-сплайна второго порядка.
-    derivative_spline = trajectory._spline.derivative(2)
-
-    # В BSpline время нормализовано в [0, 1].
-    # Поэтому для перехода к физическому времени
-    # делим вторую производную на duration^2.
-    duration = trajectory.t_end - trajectory.t_start
-
-    acceleration = derivative_spline(
-        (times - trajectory.t_start) / duration
-    ) / duration**2
-
-    return (
-        np.sqrt(weight * weights)[:, None]
-        * acceleration
-    )
+    return _derivative_residuals(trajectory, times, 2, weight)
 
 
 def jerk_residuals(
@@ -90,45 +92,24 @@ def jerk_residuals(
 
         weight * integral(||P'''(t)||^2 dt)
 
+    Единицы P''' — единицы мира / (единица времени сплайна)^3.
     Результат имеет размер (N, 3).
     """
 
-    if weight < 0:
-        raise ValueError("weight не может быть отрицательным")
-
-    if trajectory.degree < 3:
-        raise ValueError(
-            "Для рывка нужна степень сплайна >= 3"
-        )
-
-    times = np.asarray(times, dtype=float)
-
-    weights = trapezoidal_weights(times)
-
-    derivative_spline = trajectory._spline.derivative(3)
-
-    duration = trajectory.t_end - trajectory.t_start
-
-    jerk = derivative_spline(
-        (times - trajectory.t_start) / duration
-    ) / duration**3
-
-    return (
-        np.sqrt(weight * weights)[:, None]
-        * jerk
-    )
+    return _derivative_residuals(trajectory, times, 3, weight)
 
 
 def regularization_residuals(
     trajectory: BSplineTrajectory,
     times: np.ndarray,
-    lambda_acceleration: float = 1e-3,
-    lambda_jerk: float = 1e-4,
+    lambda_acceleration: float = 10.0,
+    lambda_jerk: float = 100.0,
 ) -> np.ndarray:
     """
     Объединяет остатки по ускорению и рывку.
 
-    Возвращает одномерный вектор для least_squares.
+    Возвращает одномерный вектор для least_squares:
+    сначала N*3 остатков ускорения, затем N*3 остатков рывка.
     """
 
     acceleration = acceleration_residuals(
