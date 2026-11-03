@@ -118,17 +118,19 @@ def _euler_xyz(degrees) -> np.ndarray:
 class FbxMesh:
     name: str
     vertices: np.ndarray                       # (N, 3) в системе модели FBX, с учётом иерархии трансформаций
-    local_vertices: np.ndarray                 # (N, 3) как в файле
 
 
 @dataclass
 class FbxScene:
     meshes: list[FbxMesh]
-    global_settings: dict
-    model_names: dict[int, str]
+    global_settings: dict                      # UpAxis, FrontAxis, UnitScaleFactor и т. п.
 
 
 def load_meshes(path: Path) -> FbxScene:
+    """
+    Все сетки файла в системе координат модели: Lcl Translation / Rotation / Scaling каждой
+    части применяются с учётом иерархии (Connections OO: геометрия -> модель -> родитель).
+    """
     root = read_fbx(path)
     objects = root.find("Objects")
     geometries, models = {}, {}
@@ -169,6 +171,5 @@ def load_meshes(path: Path) -> FbxScene:
         T = world(mid) if mid is not None else np.eye(4)
         name = models[mid][0] if mid is not None else gname
         transformed = verts @ T[:3, :3].T + T[:3, 3]
-        meshes.append(FbxMesh(name, transformed, verts))
-    settings = properties70(root.find("GlobalSettings"))
-    return FbxScene(meshes, settings, {k: v[0] for k, v in models.items()})
+        meshes.append(FbxMesh(name, transformed))
+    return FbxScene(meshes, properties70(root.find("GlobalSettings")))

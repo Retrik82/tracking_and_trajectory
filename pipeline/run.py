@@ -1,19 +1,19 @@
 """
-Основной пайплайн: траектория точки кабины грузовика по видео пяти камер.
+Пайплайн «Пеленг»: траектория грузовика по синхронным видео пяти камер.
 
-Шаги:
-  detect    YOLO по всем видео (кешируется в <out>/detections)
-  center    базовый вариант по центру маски: триангуляция + начальный B-сплайн (<out>/center);
-            он же — начальное приближение для кабины
-  optimize  оптимизация сплайна центра маски по пикселям (для сравнения)
-  cab       офлайн: точка кабины по 3D-коробке, подогнанной ко всем рамкам всего видео (для сравнения)
-  realtime  основной результат: трекер реального времени (только прошлые и текущий кадры),
-            обработка заезда за препятствие и потери видимости (reconstruction/visibility.py)
-  compare   метрики всех вариантов против CSV цели, графики, report.md
-  video     видео с наложением коробки и точки кабины трекера реального времени (флаг --video)
+Шаги (по порядку; каждый сохраняет результат в <out>, следующий можно запускать отдельно):
+  detect    YOLO по всем видео -> <out>/detections (кешируется)                 pipeline/detect.py
+  center    офлайн: центр маски -> триангуляция -> начальный B-сплайн -> <out>/center
+                                                                                  pipeline/center.py
+  optimize  офлайн: сплайн центра маски, подогнанный по пикселям всех камер     reconstruction/optimizer.py
+  cab       офлайн: модель коробки, подогнанная ко всем рамкам всего видео      reconstruction/cab_model.py
+  realtime  ОСНОВНОЙ: трекер реального времени (только прошлые и текущий кадры)
+            с 3D-моделью грузовика и обработкой потери видимости             reconstruction/visibility.py
+  compare   все варианты против CSV цели: <out>/report.md, metrics.json, compare/*.png
+  video     видео с силуэтом модели и точкой кабины трекера: <out>/videos (флаг --video)
 
-Варианты center, optimize и cab используют весь видеоряд сразу (заглядывают вперёд) и
-нужны только для сравнения; в реальном времени работает только realtime.
+center, optimize и cab обрабатывают весь видеоряд сразу (используют будущие кадры) и нужны
+только для сравнения. center при этом нужен всегда: его сплайн — начальное приближение для cab.
 """
 
 import argparse
@@ -26,9 +26,13 @@ from pathlib import Path
 
 import numpy as np
 
+from pipeline.center import (
+    AQUA, BLUE, CAMERA_COLORS, CAMERAS, INK_2, MAGENTA, MUTED, NUM_VIDEO_FRAMES, ORANGE, YELLOW,
+    _style, debiased_norm, find_gaps, run_evaluation, stats, truck_frame_components,
+)
+from pipeline.detect import load_detections, run_detection
 from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
 from reconstruction.cab_model import (
-    truck_axes,
     CAB_CENTER_BACK,
     CAB_CENTER_UP,
     DEFAULT_DIMENSIONS,
@@ -38,19 +42,15 @@ from reconstruction.cab_model import (
     fit_cab_trajectory,
     initial_cab_trajectory,
     offset_point_trajectory,
+    truck_axes,
 )
 from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera, video_path
 from reconstruction.objective import ObjectiveData
 from reconstruction.optimizer import optimize_trajectory
 from reconstruction.truck_model import SCENE_SCALE, TruckModel
 from reconstruction.visibility import INITIALIZING, MEASURED, PARTIAL, PREDICTED, TrackerSettings, run_tracker
-from scripts.yolo_analysis import (
-    AQUA, BLUE, INK_2, MAGENTA, MUTED, ORANGE, YELLOW, CAMERA_COLORS, CAMERAS, NUM_VIDEO_FRAMES,
-    _style, debiased_norm, find_gaps, run_evaluation, stats, truck_frame_components,
-)
-from scripts.yolo_eval import build_parser, load_detections, run_detection, setup_logging
 
-log = logging.getLogger("yolo_eval")
+log = logging.getLogger("peleng")
 ALL_STEPS = ["detect", "center", "optimize", "cab", "realtime", "compare"]
 MAIN_METHOD = "realtime"
 METHOD_NAMES = {
@@ -59,33 +59,64 @@ METHOD_NAMES = {
     "optimized": "Офлайн. Центр маски: оптимизация по пикселям",
     "cab": "Офлайн. Кабина: низ передней грани",
     "cab_center": "Офлайн. Кабина: центр кабины",
-    "realtime_ref": "Реальное время: низ передней грани",
+    "realtime_ref": "Реальное время: низ передней грани",      # с 3D-моделью — «точка CSV цели на модели»
     "realtime": "Реальное время: центр кабины (основной)",
 }
 METHOD_COLORS = {"triangulation": ORANGE, "center": MUTED, "optimized": MAGENTA, "cab": INK_2, "cab_center": AQUA,
                  "realtime_ref": YELLOW, "realtime": BLUE}
 
 
-def add_arguments(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    p.set_defaults(out=Path("outputs/main"), steps=",".join(ALL_STEPS))
-    g = p.add_argument_group("кабина")
+def build_main_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--weights", type=Path, default=Path("models/best.pt"), help="веса YOLO (.pt)")
+    p.add_argument("--data", type=Path, default=Path("tmp/project2"), help="папка с видео и CSV")
+    p.add_argument("--out", type=Path, default=Path("outputs/main"))
+    p.add_argument("--steps", default=",".join(ALL_STEPS), help=f"через запятую из: {', '.join(ALL_STEPS)}")
+    p.add_argument("--video", action="store_true", help="добавить шаг video")
+    p.add_argument("--fps", type=float, default=30.0)
+    p.add_argument("--units-per-meter", type=float, default=100.0, help="единиц мира в метре (Unreal: см)")
+    p.add_argument("--frame-offset", type=int, default=0, help="кадр CSV = кадр видео + смещение")
+
+    g = p.add_argument_group("detect")
+    g.add_argument("--redetect", action="store_true", help="пересчитать детекции, даже если они сохранены")
+    g.add_argument("--imgsz", type=int, default=960)
+    g.add_argument("--conf", type=float, default=0.25)
+    g.add_argument("--device", default=None, help="mps / cuda / cpu; по умолчанию — автоматически")
+    g.add_argument("--min-mask-area", type=float, default=400.0, help="маска меньше — флаг too_small, px")
+    g.add_argument("--min-reliable-conf", type=float, default=0.5)
+
+    g = p.add_argument_group("center (офлайн)")
+    g.add_argument("--max-reproj-px", type=float, default=20.0, help="порог отбрасывания камеры в триангуляции")
+    g.add_argument("--knot-spacing", type=float, default=15.0, help="шаг узлов сплайна, кадры")
+    g.add_argument("--huber-scale", type=float, default=100.0, help="порог Huber для сплайна, единицы мира")
+
+    g = p.add_argument_group("optimize и cab (офлайн)")
     g.add_argument("--cab-knot-spacing", type=float, default=10.0, help="шаг узлов сплайна кабины, кадры")
-    g.add_argument("--truck-length", type=float, default=DEFAULT_DIMENSIONS.length, help="начальная длина, ед. мира")
-    g.add_argument("--truck-width", type=float, default=DEFAULT_DIMENSIONS.width)
-    g.add_argument("--truck-height", type=float, default=DEFAULT_DIMENSIONS.height)
-    g.add_argument("--fixed-dimensions", action="store_true",
-                   help="не подбирать габариты (если известны из сцены Unreal)")
+    g.add_argument("--fixed-dimensions", action="store_true", help="не подбирать габариты коробки")
     g.add_argument("--lambda-acceleration", type=float, default=10.0)
     g.add_argument("--lambda-jerk", type=float, default=100.0)
     g.add_argument("--max-nfev", type=int, default=3000)
-    g.add_argument("--cab-center-back", type=float, default=CAB_CENTER_BACK,
-                   help="центр кабины: насколько назад от передней грани, ед. мира (допущение, см. cab_model)")
-    g.add_argument("--cab-center-up", type=float, default=CAB_CENTER_UP,
-                   help="центр кабины: насколько выше низа передней грани, ед. мира")
+
+    g = p.add_argument_group("грузовик")
     g.add_argument("--truck-fbx", type=Path, default=Path("models/CargoTruck.fbx"),
-                   help="3D-модель грузовика для трекера реального времени; если файла нет — коробка")
+                   help="3D-модель для трекера реального времени; если файла нет — коробка")
     g.add_argument("--truck-scale", type=float, default=SCENE_SCALE, help="масштаб актора грузовика в сцене")
+    g.add_argument("--truck-length", type=float, default=DEFAULT_DIMENSIONS.length, help="коробка: длина, ед. мира")
+    g.add_argument("--truck-width", type=float, default=DEFAULT_DIMENSIONS.width)
+    g.add_argument("--truck-height", type=float, default=DEFAULT_DIMENSIONS.height)
+    g.add_argument("--cab-center-back", type=float, default=CAB_CENTER_BACK,
+                   help="коробка: центр кабины на столько назад от передней грани, ед. мира")
+    g.add_argument("--cab-center-up", type=float, default=CAB_CENTER_UP,
+                   help="коробка: центр кабины на столько выше низа передней грани, ед. мира")
     return p
+
+
+def setup_logging(out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(out / "run.log", encoding="utf-8")],
+    )
 
 
 def camera_provider(args):
@@ -171,7 +202,7 @@ def step_realtime(args, detections) -> dict:
     if args.truck_fbx and Path(args.truck_fbx).exists():
         model = TruckModel.from_fbx(args.truck_fbx, scale=args.truck_scale)
         log.info("трекер: 3D-модель %s, масштаб %.3f, габариты %s м", args.truck_fbx, args.truck_scale,
-                 np.round(model.dimensions / args.units_per_meter, 2))
+                 " × ".join(f"{x:.2f}" for x in model.dimensions / args.units_per_meter))
         METHOD_NAMES["realtime_ref"] = "Реальное время: точка CSV цели на модели"
     else:
         log.warning("трекер: 3D-модели %s нет, используется коробка %s", args.truck_fbx, dims)
@@ -604,7 +635,3 @@ def run(args) -> None:
             log.info("отчёт: %s", args.out / "report.md")
         if "video" in steps:
             render_videos(args, detections, ctx)
-
-
-def build_main_parser() -> argparse.ArgumentParser:
-    return add_arguments(build_parser(__doc__))

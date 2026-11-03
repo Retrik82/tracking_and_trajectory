@@ -36,7 +36,6 @@ class TruckModel:
     dimensions: np.ndarray               # (3,) длина, ширина, высота
     csv_point: np.ndarray                # (3,) точка, которую пишет CSV цели
     cab_center: np.ndarray               # (3,) центр габаритов кабины
-    front_bottom: np.ndarray             # (3,) низ передней грани по центру
 
     @classmethod
     def from_fbx(cls, path: Path, scale: float = SCENE_SCALE,
@@ -59,8 +58,7 @@ class TruckModel:
             cab_v = cab_v[cab_v[:, 0] > cargo_front]
         cab_center = (cab_v.min(axis=0) + cab_v.max(axis=0)) / 2 - center
         csv_point = np.array([csv_point_model[0], 0.0, csv_point_model[1]]) * scale - center
-        front_bottom = np.array([hi[0], 0.0, lo[2]]) - center
-        return cls(hull, hi - lo, csv_point, cab_center, front_bottom)
+        return cls(hull, hi - lo, csv_point, cab_center)
 
     def to_world(self, center: np.ndarray, forward: np.ndarray, side: np.ndarray, up: np.ndarray,
                  local: np.ndarray) -> np.ndarray:

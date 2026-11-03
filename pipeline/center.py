@@ -1,24 +1,30 @@
-"""Анализ детекций YOLO: триангуляция, сплайн, метрики относительно CSV цели, графики, видео."""
+"""
+Шаг center (офлайн, базовый вариант): точка объекта — центр маски YOLO.
+
+Триангуляция по кадрам -> начальный B-сплайн -> метрики против CSV цели -> графики и
+<out>/center/report.md. Этот сплайн — начальное приближение для офлайн-модели кабины.
+Здесь же проверка смещения кадров видео ↔ CSV (OFFSETS_TO_SCAN) и общие для отчётов
+функции: статистики, разложение ошибки в осях грузовика, палитра графиков.
+"""
 
 import json
 import logging
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from detection.schema import Detection
-from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
-from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera, video_path
+from reconstruction.bspline import fit_initial_bspline
+from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera
 from reconstruction.triangulation import triangulate_robust
 
 CAMERAS = [1, 2, 3, 4, 5]
 NUM_VIDEO_FRAMES = 1001
 OFFSETS_TO_SCAN = range(-3, 4)
-log = logging.getLogger("yolo_eval")
+log = logging.getLogger("peleng")
 
-# Палитра (dataviz reference palette, светлая тема)
+# Палитра графиков (светлая тема); порядок цветов камер фиксирован, чтобы камера везде была одного цвета
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
 INK_2 = "#52514e"
@@ -536,84 +542,3 @@ def write_report(out: Path, m: dict) -> None:
         )
     lines += ["", "## Графики", ""] + [f"![{p.stem}](plots/{p.name})" for p in sorted((out / "plots").glob("*.png"))]
     (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-# ---------------------------------------------------------------- видео
-
-def run_video(args, result: dict, load_polygons) -> None:
-    import cv2
-
-    c = result["ctx"]
-    upm, offset = c["upm"], c["offset"]
-    out_dir = args.out / "videos"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    trail = 90
-
-    def bgr(hex_color):
-        h = hex_color.lstrip("#")
-        return tuple(int(h[i:i + 2], 16) for i in (4, 2, 0))
-
-    for cam in CAMERAS:
-        polygons = load_polygons(args.out, cam)
-        cap = cv2.VideoCapture(str(video_path(args.data, cam)))
-        target_file = out_dir / f"overlay_cam{cam}.mp4"
-        ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{IMAGE_WIDTH}x{IMAGE_HEIGHT}",
-             "-r", str(args.fps), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-             "-pix_fmt", "yuv420p", str(target_file)],
-            stdin=subprocess.PIPE,
-        )
-        for f in range(NUM_VIDEO_FRAMES):
-            ok, img = cap.read()
-            if not ok:
-                break
-            camera = c["cameras"].get(cam, f + offset)
-            if f in polygons:
-                cv2.polylines(img, [polygons[f].astype(np.int32)], True, bgr(BLUE), 2, cv2.LINE_AA)
-            d = c["detections"][cam].get(f)
-            if d is not None:
-                color = bgr(ORANGE) if d.unreliable else bgr(BLUE)
-                cv2.rectangle(img, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), color, 1, cv2.LINE_AA)
-                cv2.drawMarker(img, (int(d.point_u), int(d.point_v)), color, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
-            # след сплайна
-            lo = max(0, f - trail)
-            pts = [camera.project(c["spline_points"][k]) for k in range(lo, f + 1) if c["span"][k]]
-            pts = np.array([p for p in pts if np.all(np.isfinite(p))], dtype=np.int32)
-            if len(pts) > 1:
-                cv2.polylines(img, [pts], False, bgr(YELLOW), 2, cv2.LINE_AA)
-            if c["gt_valid"][f]:
-                g = camera.project(c["gt"][f])
-                if np.all(np.isfinite(g)):
-                    cv2.drawMarker(img, (int(g[0]), int(g[1])), bgr(AQUA), cv2.MARKER_DIAMOND, 14, 2, cv2.LINE_AA)
-            lines = [f"Cam{cam}  frame {f}"]
-            if c["span"][f]:
-                s = camera.project(c["spline_points"][f])
-                if np.all(np.isfinite(s)):
-                    cv2.circle(img, (int(s[0]), int(s[1])), 8, bgr(YELLOW), 3, cv2.LINE_AA)
-                p = c["spline_points"][f] / upm
-                status = f"MEASURED ({c['n_inliers'][f]} cams)" if c["ok"][f] else "SPLINE ONLY"
-                lines += [f"X {p[0]:.1f}  Y {p[1]:.1f}  Z {p[2]:.1f} m",
-                          f"speed {c['speed'][f]:.1f} m/s ({c['speed'][f] * 3.6:.0f} km/h)",
-                          status]
-                if c["gt_valid"][f]:
-                    lines.append(f"error vs target {c['spl_err'][f]:.2f} m")
-            else:
-                lines.append("outside spline range")
-            lines.append("YOLO trained on these videos")
-            cv2.rectangle(img, (10, 10), (470, 20 + 30 * len(lines)), (20, 20, 20), -1)
-            for i, text in enumerate(lines):
-                color = (255, 255, 255)
-                if text.startswith("SPLINE ONLY"):
-                    color = bgr(ORANGE)
-                cv2.putText(img, text, (20, 38 + 30 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-            legend = [("mask / detection", BLUE), ("flagged detection", ORANGE),
-                      ("spline + trail", YELLOW), ("target CSV", AQUA)]
-            for i, (text, col) in enumerate(legend):
-                y = IMAGE_HEIGHT - 20 - 26 * (len(legend) - 1 - i)
-                cv2.rectangle(img, (16, y - 12), (32, y + 2), bgr(col), -1)
-                cv2.putText(img, text, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            ffmpeg.stdin.write(img.tobytes())
-        cap.release()
-        ffmpeg.stdin.close()
-        ffmpeg.wait()
-        log.info("видео: %s", target_file)

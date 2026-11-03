@@ -1,7 +1,6 @@
 
 from dataclasses import dataclass
 
-import numpy as np
 from scipy.optimize import least_squares
 
 from reconstruction.bspline import BSplineTrajectory

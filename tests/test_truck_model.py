@@ -39,7 +39,6 @@ def test_truck_model_points_and_scale():
     # Центр кабины — впереди и выше середины, внутри габаритов; точка CSV — у переднего края
     assert 0 < model.cab_center[0] < half[0] and model.cab_center[2] > -half[2]
     assert model.csv_point[0] > model.cab_center[0]
-    assert model.front_bottom[0] == pytest.approx(half[0]) and model.front_bottom[2] == pytest.approx(-half[2])
 
 
 def box_model(dims: TruckDimensions) -> TruckModel:
@@ -48,7 +47,7 @@ def box_model(dims: TruckDimensions) -> TruckModel:
     center = (corners.min(0) + corners.max(0)) / 2
     d = dims.as_array()
     return TruckModel(hull=corners - center, dimensions=d, csv_point=np.array([d[0] / 2, 0, -d[2] / 2]),
-                      cab_center=np.zeros(3), front_bottom=np.array([d[0] / 2, 0, -d[2] / 2]))
+                      cab_center=np.zeros(3))
 
 
 def test_model_measurement_equals_box_for_box_shape():
