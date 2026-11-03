@@ -1,12 +1,11 @@
 
 from dataclasses import dataclass
 
-import numpy as np
 from scipy.optimize import least_squares
 
-from mct.reconstruction.bspline import BSplineTrajectory
-from mct.reconstruction.camera import Camera
-from mct.reconstruction.objective import (
+from reconstruction.bspline import BSplineTrajectory
+from reconstruction.objective import (
+    Cameras,
     ObjectiveData,
     TrajectoryObjective,
     build_trajectory,
@@ -40,17 +39,17 @@ class OptimizationResult:
 
 def optimize_trajectory(
     initial_trajectory: BSplineTrajectory,
-    cameras: list[Camera],
+    cameras: Cameras,
     data: ObjectiveData,
-    lambda_acceleration: float = 1e-3,
-    lambda_jerk: float = 1e-4,
+    lambda_acceleration: float = 10.0,
+    lambda_jerk: float = 100.0,
     regularization_samples: int = 200,
     max_nfev: int = 1000,
     ftol: float = 1e-8,
     xtol: float = 1e-8,
     gtol: float = 1e-8,
-    loss: str = "linear",
-    f_scale: float = 1.0,
+    loss: str = "huber",
+    f_scale: float = 5.0,
 ) -> OptimizationResult:
     """
     Оптимизирует контрольные точки B-сплайна.
@@ -66,7 +65,8 @@ def optimize_trajectory(
             Начальная B-сплайн траектория.
 
         cameras:
-            Список камер.
+            Список неподвижных камер (по camera_indices) или функция
+            (индекс камеры, кадр CSV) -> Camera, если камера поворачивается.
 
         data:
             Исходные пиксельные наблюдения.
@@ -76,6 +76,12 @@ def optimize_trajectory(
 
         lambda_jerk:
             Вес регуляризации по рывку.
+
+            Веса зависят от единиц: значения по умолчанию подобраны для мира
+            в сантиметрах и времени в кадрах (30 FPS). На детекциях YOLO при
+            1e-3 / 1e-4 регуляризация почти не действует (максимум скорости
+            ~50 м/с при реальных ~32 м/с, оптимизатор не сходится за 2000 итераций),
+            при 10 / 100 сходится и даёт ~40 м/с при той же ошибке перепроецирования.
 
         regularization_samples:
             Количество временных точек для регуляризации.
@@ -88,10 +94,10 @@ def optimize_trajectory(
 
         loss:
             Тип функции потерь: linear, soft_l1, huber,
-            cauchy или arctan.
+            cauchy или arctan. По умолчанию huber: детекции содержат выбросы.
 
         f_scale:
-            Масштаб для робастной функции потерь.
+            Масштаб для робастной функции потерь, пиксели (с учётом sqrt(confidence)).
 
     Returns:
         OptimizationResult.
@@ -137,6 +143,7 @@ def optimize_trajectory(
         x0=initial_parameters,
         method="trf",
         jac="2-point",
+        jac_sparsity=objective.jac_sparsity(),
         x_scale="jac",
         loss=loss,
         f_scale=f_scale,
