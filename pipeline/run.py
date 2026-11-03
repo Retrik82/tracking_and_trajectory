@@ -30,6 +30,7 @@ from pipeline.center import (
     AQUA, BLUE, CAMERA_COLORS, CAMERAS, INK_2, MAGENTA, MUTED, NUM_VIDEO_FRAMES, ORANGE, YELLOW,
     _style, debiased_norm, find_gaps, run_evaluation, stats, truck_frame_components,
 )
+from pipeline.coverage import plot_camera_coverage
 from pipeline.detect import load_detections, run_detection
 from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
 from reconstruction.cab_model import (
@@ -394,139 +395,6 @@ def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     plt.close(fig)
 
 
-SEEN, SEEN_FLAGGED, OCCLUDED, OUT_OF_VIEW = 0, 1, 2, 3
-COVERAGE_LABELS = {
-    SEEN: "в поле зрения, найден",
-    SEEN_FLAGGED: "найден с флагом (край кадра, мала, ненадёжна)",
-    OCCLUDED: "в поле зрения, но не найден — загорожен",
-    OUT_OF_VIEW: "вне поля зрения",
-}
-COVERAGE_COLORS = {SEEN: BLUE, SEEN_FLAGGED: "#86b6ef", OCCLUDED: ORANGE, OUT_OF_VIEW: "#d6d5d0"}
-
-
-def camera_coverage(args, detections, gt: np.ndarray) -> dict[int, np.ndarray]:
-    """
-    Состояние каждой камеры на каждом кадре по положению цели из CSV (только для оценки).
-
-    «В поле зрения» — точка цели проецируется в кадр перед камерой (поза камеры с этого кадра).
-    Если при этом детекции нет, грузовик загорожен (или детектор его пропустил).
-    """
-    state = {}
-    for cam in CAMERAS:
-        s = np.full(NUM_VIDEO_FRAMES, OUT_OF_VIEW)
-        for f in range(NUM_VIDEO_FRAMES):
-            d = detections[cam].get(f)
-            if d is not None:
-                s[f] = SEEN_FLAGGED if d.unreliable else SEEN
-            elif np.all(np.isfinite(gt[f])):
-                uv = make_camera(args.data, cam, f + args.frame_offset).project(gt[f])
-                if np.all(np.isfinite(uv)) and 0 <= uv[0] < IMAGE_WIDTH and 0 <= uv[1] < IMAGE_HEIGHT:
-                    s[f] = OCCLUDED
-        state[cam] = s
-    return state
-
-
-def _fov_wedge(camera, radius: float) -> np.ndarray:
-    """Горизонтальный сектор поля зрения камеры на виде сверху: многоугольник (K, 2)."""
-    half = np.arctan(camera.c_x / camera.f_x)
-    yaw = np.arctan2(camera.forward[1], camera.forward[0])
-    angles = np.linspace(yaw - half, yaw + half, 24)
-    p = camera.position[:2]
-    return np.vstack([p, p + radius * np.c_[np.cos(angles), np.sin(angles)], p])
-
-
-def plot_camera_coverage(out: Path, c: dict, args, detections) -> dict[int, np.ndarray]:
-    """Вид сверху: поля зрения камер и участки траектории, где грузовик виден, загорожен или вне кадра."""
-    plt = _style()
-    upm = args.units_per_meter
-    gt = c["gt"]
-    valid = np.all(np.isfinite(gt), axis=1)
-    xy = gt[:, :2] / upm
-    state = camera_coverage(args, detections, gt)
-    cams0 = {cam: make_camera(args.data, cam, args.frame_offset) for cam in CAMERAS}
-    radius = max(np.nanmax(np.linalg.norm(gt[valid, :2] - cams0[cam].position[:2], axis=1)) for cam in CAMERAS) * 1.05
-
-    corners = np.vstack([xy[valid]] + [cams0[cam].position[None, :2] / upm for cam in CAMERAS])
-    lo, hi = corners.min(axis=0) - 25, corners.max(axis=0) + 25
-
-    aspect = (hi[1] - lo[1]) / (hi[0] - lo[0])
-    fig, axes = plt.subplots(2, 3, figsize=(18, 2 * 6 * aspect + 2.2))
-    axes = axes.ravel()
-
-    def base(ax, title):
-        ax.plot(xy[valid, 0], xy[valid, 1], color="#d6d5d0", lw=6, solid_capstyle="round", zorder=1)
-        for cam in CAMERAS:
-            p = cams0[cam].position[:2] / upm
-            ax.scatter(*p, marker="^", s=70, color=CAMERA_COLORS[cam], edgecolor="white", lw=1.5, zorder=6)
-            ax.annotate(f"Cam{cam}", p, xytext=(6, 6), textcoords="offset points", color=INK_2, fontsize=9, zorder=7)
-        ax.set_xlim(lo[0], hi[0])
-        ax.set_ylim(lo[1], hi[1])
-        ax.set_aspect("equal")
-        ax.set_title(title, fontsize=11)
-        ax.tick_params(labelsize=8)
-
-    def wedges(ax, cam, emphasis: bool):
-        frames = [0]
-        if cam == 5:                     # Camera5 поворачивается по yaw на кадрах 565–960
-            frames = list(range(0, NUM_VIDEO_FRAMES, 50))
-        for i, f in enumerate(frames):
-            w = _fov_wedge(make_camera(args.data, cam, f + args.frame_offset), radius) / upm
-            alpha = (0.10 if emphasis else 0.05) if len(frames) == 1 else 0.03
-            ax.fill(w[:, 0], w[:, 1], color=CAMERA_COLORS[cam], alpha=alpha, lw=0, zorder=0)
-            ax.plot(w[:, 0], w[:, 1], color=CAMERA_COLORS[cam], lw=0.8 if emphasis else 0.5,
-                    alpha=0.7 if emphasis else 0.4, zorder=0)
-
-    # Обзор: сколько камер нашли грузовик на каждом участке (последовательная шкала одного цвета)
-    ax = axes[0]
-    seen = sum((state[cam] <= SEEN_FLAGGED).astype(int) for cam in CAMERAS)
-    occluded_any = np.any([state[cam] == OCCLUDED for cam in CAMERAS], axis=0)
-    base(ax, f"Обзор: сколько камер нашли грузовик\n(загорожен хотя бы на одной камере: "
-             f"{int((valid & occluded_any).sum())} кадров из {int(valid.sum())})")
-    for cam in CAMERAS:
-        wedges(ax, cam, emphasis=False)
-    ramp = {0: ORANGE, 1: "#b7d3f6", 2: "#6da7ec", 3: "#2a78d6", 4: "#184f95", 5: "#0d366b"}
-    count_handles = []
-    for k in sorted(ramp):
-        m = valid & (seen == k)
-        if m.any():
-            count_handles.append(ax.scatter(xy[m, 0], xy[m, 1], s=10, color=ramp[k], lw=0, zorder=3,
-                                            label={0: "ни одной камеры", 1: "1 камера"}.get(k, f"{k} камеры")))
-    for f in range(0, NUM_VIDEO_FRAMES, 200):
-        if valid[f]:
-            ax.annotate(f"кадр {f}", xy[f], xytext=(5, -11), textcoords="offset points", fontsize=8, color=INK_2,
-                        zorder=8)
-    ax.legend(handles=count_handles, loc="lower left", fontsize=8, markerscale=1.5, title="нашли грузовик",
-              title_fontsize=8)
-
-    # По камере
-    for ax, cam in zip(axes[1:], CAMERAS):
-        s = state[cam]
-        in_view = int(((s == SEEN) | (s == SEEN_FLAGGED) | (s == OCCLUDED)).sum())
-        title = f"Cam{cam}: в поле зрения {in_view} кадров, загорожен {int((s == OCCLUDED).sum())}"
-        if cam == 5:
-            title += "\n(поворачивается: секторы через каждые 50 кадров)"
-        base(ax, title)
-        wedges(ax, cam, emphasis=True)
-        for code in (OUT_OF_VIEW, SEEN_FLAGGED, SEEN, OCCLUDED):
-            m = valid & (s == code)
-            if m.any():
-                ax.scatter(xy[m, 0], xy[m, 1], s=12 if code == OCCLUDED else 8, color=COVERAGE_COLORS[code], lw=0,
-                           zorder=3 if code != OUT_OF_VIEW else 2)
-
-    from matplotlib.lines import Line2D
-    handles = [Line2D([], [], ls="", marker="o", ms=7, color=COVERAGE_COLORS[k], label=COVERAGE_LABELS[k])
-               for k in (SEEN, SEEN_FLAGGED, OCCLUDED, OUT_OF_VIEW)]
-    handles.append(Line2D([], [], ls="", marker="s", ms=10, color="#9ec5f4", alpha=0.5, label="поле зрения камеры"))
-    fig.legend(handles=handles, loc="lower center", ncol=5, fontsize=9, frameon=False)
-    fig.suptitle("Вид сверху: поля зрения камер и загораживание грузовика "
-                 "(положение — по CSV цели, только для оценки; X вправо, Y вверх, м)",
-                 x=0.01, ha="left", fontweight="bold", color=INK_2, fontsize=12)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.97))
-    fig.savefig(out / "06_camera_coverage_top.png", dpi=120)
-    plt.close(fig)
-    return state
-
-
 def _fmt(s: dict) -> str:
     if not s or not s.get("n"):
         return "—"
@@ -764,7 +632,7 @@ def run(args) -> None:
         if "compare" in steps:
             (args.out / "compare").mkdir(parents=True, exist_ok=True)
             plot_comparison(args.out / "compare", ctx, cab, args)
-            plot_camera_coverage(args.out / "compare", ctx, args, detections)
+            plot_camera_coverage(args.out / "compare", ctx["gt"], args, detections)
             write_report(args, metrics, cab, ctx)
             (args.out / "metrics.json").write_text(json.dumps(
                 {"main_method": MAIN_METHOD, "dimensions_m": (cab["dimensions"].as_array() / args.units_per_meter).tolist(),
