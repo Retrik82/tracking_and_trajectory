@@ -3,11 +3,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from mct.reconstruction.bspline import BSplineTrajectory
-from mct.reconstruction.camera import Camera
-from mct.reconstruction.objective import (
+from reconstruction.bspline import BSplineTrajectory
+from reconstruction.objective import (
+    Cameras,
     ObjectiveData,
-    project_point,
+    ObservationGeometry,
+    observation_cameras,
+    validate_objective_data,
 )
 
 
@@ -16,7 +18,8 @@ class TrajectoryMetrics:
     """
     Метрики качества одной траектории.
 
-    Все ошибки репроекции измеряются в пикселях.
+    Ошибки репроекции — в пикселях. Ускорение и рывок — в единицах мира
+    за (единицу времени сплайна)^2 и ^3, например см/кадр^2.
     """
 
     reprojection_mae: float
@@ -32,38 +35,26 @@ class TrajectoryMetrics:
 
 def calculate_reprojection_errors(
     trajectory: BSplineTrajectory,
-    cameras: list[Camera],
+    cameras: Cameras,
     data: ObjectiveData,
 ) -> np.ndarray:
     """
     Вычисляет евклидовы ошибки репроекции для всех наблюдений.
 
-    Возвращает массив (M,), где каждый элемент — ошибка в пикселях.
+    Возвращает массив (M,), где каждый элемент — ошибка в пикселях;
+    inf, если точка сплайна оказалась позади камеры.
     """
 
+    validate_objective_data(data, cameras, trajectory)
+    geometry = ObservationGeometry.from_cameras(
+        observation_cameras(cameras, data)
+    )
+
     predicted_points = trajectory.evaluate(data.times)
+    pixels, depth = geometry.project(predicted_points)
 
-    errors = np.zeros(len(data.times), dtype=float)
-
-    for index, point_3d in enumerate(predicted_points):
-        camera_index = int(data.camera_indices[index])
-
-        camera = cameras[camera_index]
-
-        predicted_pixel, depth = project_point(
-            camera,
-            point_3d,
-        )
-
-        observed_pixel = data.pixels[index]
-
-        if depth <= 0:
-            errors[index] = np.inf
-            continue
-
-        errors[index] = np.linalg.norm(
-            predicted_pixel - observed_pixel
-        )
+    errors = np.linalg.norm(pixels - data.pixels, axis=1)
+    errors[depth <= 0] = np.inf
 
     return errors
 
@@ -81,8 +72,7 @@ def calculate_smoothness(
     Рывок:
         P'''(t)
 
-    Производные учитывают переход от нормализованного
-    времени сплайна к исходному времени.
+    Среднеквадратичные значения по времени (интеграл / длительность).
     """
 
     if trajectory.degree < 3:
@@ -101,20 +91,9 @@ def calculate_smoothness(
 
     duration = trajectory.t_end - trajectory.t_start
 
-    normalized_times = (
-        (times - trajectory.t_start) / duration
-    )
-
-    acceleration_spline = trajectory._spline.derivative(2)
-    jerk_spline = trajectory._spline.derivative(3)
-
-    acceleration = (
-        acceleration_spline(normalized_times) / duration**2
-    )
-
-    jerk = (
-        jerk_spline(normalized_times) / duration**3
-    )
+    # Сплайн задан в физическом времени — производные берутся напрямую.
+    acceleration = trajectory.derivative(2).evaluate(times)
+    jerk = trajectory.derivative(3).evaluate(times)
 
     acceleration_squared = np.sum(
         acceleration**2,
@@ -148,7 +127,7 @@ def calculate_smoothness(
 
 def calculate_metrics(
     trajectory: BSplineTrajectory,
-    cameras: list[Camera],
+    cameras: Cameras,
     data: ObjectiveData,
     smoothness_samples: int = 500,
 ) -> TrajectoryMetrics:
@@ -185,7 +164,7 @@ def calculate_metrics(
     # Отдельные показатели для каждой камеры.
     errors_by_camera = {}
 
-    for camera_index in range(len(cameras)):
+    for camera_index in np.unique(data.camera_indices).tolist():
         mask = data.camera_indices == camera_index
 
         camera_errors = errors[mask]
@@ -216,43 +195,90 @@ def calculate_metrics(
     )
 
 
+def position_error_stats(
+    trajectory: BSplineTrajectory,
+    times: np.ndarray,
+    target_points: np.ndarray,
+    units_per_meter: float = 100.0,
+) -> dict[str, float]:
+    """
+    Ошибка положения сплайна относительно эталона (CSV цели), в метрах.
+
+    Строки target_points с NaN (испорченные ячейки CSV) пропускаются.
+    """
+
+    times = np.asarray(times, dtype=float)
+    target_points = np.asarray(target_points, dtype=float)
+
+    if target_points.shape != (len(times), 3):
+        raise ValueError("target_points должен иметь форму (len(times), 3)")
+
+    valid = np.all(np.isfinite(target_points), axis=1)
+
+    if not np.any(valid):
+        raise ValueError("Нет корректных эталонных точек")
+
+    errors = np.linalg.norm(
+        trajectory.evaluate(times[valid]) - target_points[valid],
+        axis=1,
+    ) / units_per_meter
+
+    return {
+        "count": int(len(errors)),
+        "median": float(np.median(errors)),
+        "p95": float(np.percentile(errors, 95)),
+        "rmse": float(np.sqrt(np.mean(errors**2))),
+        "max": float(np.max(errors)),
+    }
+
+
 def compare_trajectories(
     initial_trajectory: BSplineTrajectory,
     optimized_trajectory: BSplineTrajectory,
-    cameras: list[Camera],
+    cameras: Cameras,
     data: ObjectiveData,
+    target_times: np.ndarray | None = None,
+    target_points: np.ndarray | None = None,
+    units_per_meter: float = 100.0,
 ) -> dict[str, dict[str, float]]:
     """
     Сравнивает начальную и оптимизированную траектории.
 
-    Возвращает словарь с метриками обеих траекторий.
+    Возвращает словарь с метриками обеих траекторий. Если передан эталон
+    (target_times, target_points), добавляет ошибку положения в метрах.
     """
 
-    initial = calculate_metrics(
-        initial_trajectory,
-        cameras,
-        data,
-    )
+    result = {}
 
-    optimized = calculate_metrics(
-        optimized_trajectory,
-        cameras,
-        data,
-    )
+    for name, trajectory in (
+        ("initial", initial_trajectory),
+        ("optimized", optimized_trajectory),
+    ):
+        metrics = calculate_metrics(
+            trajectory,
+            cameras,
+            data,
+        )
 
-    return {
-        "initial": {
-            "reprojection_mae": initial.reprojection_mae,
-            "reprojection_rmse": initial.reprojection_rmse,
-            "reprojection_max": initial.reprojection_max,
-            "acceleration_rms": initial.acceleration_rms,
-            "jerk_rms": initial.jerk_rms,
-        },
-        "optimized": {
-            "reprojection_mae": optimized.reprojection_mae,
-            "reprojection_rmse": optimized.reprojection_rmse,
-            "reprojection_max": optimized.reprojection_max,
-            "acceleration_rms": optimized.acceleration_rms,
-            "jerk_rms": optimized.jerk_rms,
-        },
-    }
+        result[name] = {
+            "reprojection_mae": metrics.reprojection_mae,
+            "reprojection_rmse": metrics.reprojection_rmse,
+            "reprojection_max": metrics.reprojection_max,
+            "acceleration_rms": metrics.acceleration_rms,
+            "jerk_rms": metrics.jerk_rms,
+        }
+
+        if target_times is not None and target_points is not None:
+            position = position_error_stats(
+                trajectory,
+                target_times,
+                target_points,
+                units_per_meter,
+            )
+
+            result[name].update({
+                f"position_{key}_m" if key != "count" else "position_count": value
+                for key, value in position.items()
+            })
+
+    return result
