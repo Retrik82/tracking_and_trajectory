@@ -55,7 +55,7 @@ tracking_and_trajectory: высокоточный мультикамерный 3
 
 - Точность и производительность на реальных видео (нет данных в среде).
 - Инференс YOLO: FPS, задержка, загрузка GPU.
-- Видео с наложением на реальных кадрах (путь проверен на синтетических видеофайлах).
+- Видео с наложением на реальных кадрах (записано только на синтетических видеофайлах, `docs/results/demo/`).
 
 ## 2. Архитектура
 
@@ -202,6 +202,24 @@ YOLO26s-seg 960 px порядка 100–300 мс/кадр на камеру (н�
 .venv/bin/python main.py
 ```
 
-Пример видео: `outputs/stream/videos/stream_cam{N}.mp4` после `replay --video` (в среде не создано —
-нет видео). Графики: `docs/results/synthetic/stream/plots/*.png`, `docs/results/synthetic/variants/*.png`,
-`docs/results/synthetic/compare/*.png`.
+### Демонстрационные видео
+
+Реальных видео в среде не было, поэтому демонстрация записана на синтетических видеофайлах пяти
+камер (`tools/render_synthetic_video.py`, та же сцена, что и детекции): `stream.py replay --detections
+... --video` — готовые детекции вместо YOLO, полный конвейер (планировщик, триангуляция, фильтр,
+сплайн), наложение модели, двух траекторий и HUD. Файлы `outputs/synthetic/demo/videos/stream_cam{1..5}.mp4`
+(по 1001 кадру), кадры и отчёты — `docs/results/demo/`. Измерено там же: визуализация пяти камер
+1080p стоит 87 мс на тик и в реальном темпе на 4 ядрах CPU даёт 10 тиков/с с вытеснением 38 % кадров;
+без визуализации конвейер — 7 мс на тик.
+
+### Запуск на реальных видео (у вас: `D:\project2`)
+
+```bash
+python stream.py replay --data D:\project2 --video                  # YOLO (models\best.pt), FBX (models\CargoTruck.fbx)
+python stream.py replay --data D:\project2 --video --set output.video_cameras=[5]   # одна камера — ближе к реальному темпу
+python main.py --data D:\project2                                   # офлайн-конвейер, сравнение методов, видео
+python stream.py variants --data D:\project2 --detections outputs\main\detections --out outputs\main\variants
+```
+
+Графики: `docs/results/synthetic/stream/plots/*.png`, `docs/results/synthetic/variants/*.png`,
+`docs/results/synthetic/compare/*.png`, `docs/results/demo/*.png`.

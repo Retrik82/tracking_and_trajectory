@@ -64,7 +64,11 @@ python main.py --data tmp/synthetic --out outputs/synthetic --no-video
 неопределённость, камеры и задержка), `videos/stream_cam{N}.mp4` (`--video`).
 
 Режимы: `replay` — записанные видео с исходной частотой и общим стартом; `live` — URL/устройства;
-`detections` — готовые детекции без кадров (единственный режим без весов и видео). Все параметры —
+`detections` — готовые детекции без кадров (единственный режим без весов и видео). В `replay`/`live`
+флаг `--detections <папка>` подставляет готовые детекции вместо YOLO (демонстрация без весов).
+Демо без реальных видео: `python tools/render_synthetic_video.py --data tmp/synthetic`, затем
+`python stream.py replay --data tmp/synthetic --detections outputs/synthetic/detections --out outputs/synthetic/demo --video --no-pacing`
+(см. `docs/results/demo/`). Все параметры —
 `pipeline/config.py` (`--set раздел.ключ=значение`), число камер — `cameras.ids`.
 
 ## Как обрабатывается видео

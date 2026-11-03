@@ -877,7 +877,9 @@ def main(argv=None) -> None:
     p.add_argument("--set", action="append", default=[], help="переопределение: раздел.ключ=значение")
     p.add_argument("--mode", choices=["live", "replay", "detections"], default=None)
     p.add_argument("--data", type=Path, default=Path("tmp/project2"))
-    p.add_argument("--detections", type=Path, default=None, help="папка с cam{N}.csv (режим detections)")
+    p.add_argument("--detections", type=Path, default=None,
+                   help="папка с cam{N}.csv: режим detections — источник кадров; replay/live — готовые детекции "
+                        "вместо YOLO (демонстрация без весов)")
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--num-frames", type=int, default=None, help="режим detections: число кадров (по умолчанию из CSV)")
     p.add_argument("--video", action="store_true", help="писать видео с наложением (replay/live)")
@@ -897,11 +899,16 @@ def main(argv=None) -> None:
     if args.no_pacing:
         cfg.streaming.realtime_pacing = False
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    detections, num = None, None
+    detections, num, detector = None, None, None
     if cfg.streaming.mode == "detections":
         det_dir = args.detections or (Path(cfg.output.out_dir) / "detections")
         detections, num = load_detections_table(det_dir, cfg.cameras.ids)
         num = args.num_frames or num
+    elif args.detections is not None:
+        table, _ = load_detections_table(args.detections, cfg.cameras.ids)
+        detector = PrecomputedDetector(table)
+        log.warning("replay/live с готовыми детекциями из %s: YOLO не запускается, время детекции не измеряется",
+                    args.detections)
     visualizer = None
     if cfg.output.video and cfg.streaming.mode != "detections":
         target = None
@@ -913,7 +920,8 @@ def main(argv=None) -> None:
         except Exception:  # noqa: BLE001
             pass
         visualizer = StreamVisualizer(cfg, Path(cfg.output.out_dir), cfg.output.video_cameras or cfg.cameras.ids, target)
-    pipeline = StreamPipeline(cfg, args.data, Path(cfg.output.out_dir), detections, num, visualizer=visualizer)
+    pipeline = StreamPipeline(cfg, args.data, Path(cfg.output.out_dir), detections, num, visualizer=visualizer,
+                              detector=detector)
     pipeline.run()
     perf = pipeline.performance()
     print(performance_markdown(perf))
