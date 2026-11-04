@@ -232,6 +232,16 @@ def step_realtime(args, detections) -> dict:
 
 # ---------------------------------------------------------------- сравнение
 
+def trajectory_acceleration(points: np.ndarray, fps: float, upm: float) -> np.ndarray:
+    """
+    Ускорение по самой траектории (вторая разность положений), м/с². В отличие от скачка скорости
+    фильтра видит и «телепортацию» — сдвиг положения поправкой измерения в обход скорости.
+    """
+    acc = np.full(len(points), np.nan)
+    acc[1:-1] = np.linalg.norm(points[2:] - 2 * points[1:-1] + points[:-2], axis=1) * fps ** 2 / upm
+    return acc
+
+
 def evaluate_methods(args, detections, center_result, optimized, cab, realtime) -> tuple[dict, dict]:
     upm, fps = args.units_per_meter, args.fps
     target = load_target(args.data)
@@ -284,6 +294,7 @@ def evaluate_methods(args, detections, center_result, optimized, cab, realtime) 
             # Одинаковая для всех вариантов мера скачков: изменение скорости между кадрами, м/с²
             jumps = np.abs(np.diff(speed)) * fps
             jumps = jumps[np.isfinite(jumps)]
+            traj_acc = trajectory_acceleration(pts, fps, upm)
             path = float(np.nansum(np.linalg.norm(np.diff(pts[span], axis=0), axis=1)) / upm)
             gt_path = float(np.sum(np.linalg.norm(np.diff(gt_spline.evaluate(csv_t[span]), axis=0), axis=1)) / upm)
             m["kinematics"] = {
@@ -291,15 +302,18 @@ def evaluate_methods(args, detections, center_result, optimized, cab, realtime) 
                 "speed_error_mps": stats(np.abs(speed - gt_speed)[span]),
                 "speed_change_max_mps2": float(jumps.max()),
                 "speed_change_p99_mps2": float(np.percentile(jumps, 99)),
+                "trajectory_accel_mps2": stats(traj_acc[np.isfinite(traj_acc)]),
                 "path_m": path, "target_path_m": gt_path,
             }
         s["error"] = err
         metrics[name] = m
 
     target_jumps = np.abs(np.diff(gt_speed)) * fps
+    target_acc = trajectory_acceleration(gt, fps, upm)
     ctx_out = dict(frames=frames, gt=gt, gt_valid=gt_valid, gt_speed=gt_speed, series=series,
                    detected_cams=detected_cams, target_issues=target.issues,
-                   target_speed_change_p99=float(np.percentile(target_jumps, 99)), realtime=realtime)
+                   target_speed_change_p99=float(np.percentile(target_jumps, 99)),
+                   target_trajectory_accel=stats(target_acc[np.isfinite(target_acc)]), realtime=realtime)
     return metrics, ctx_out
 
 
@@ -432,15 +446,17 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
         "",
         "| Вариант | кадров | ошибка положения | без постоянного смещения | смещение вдоль / поперёк / верт., м "
         "| макс. скорость, м/с | ошибка скорости, медиана / p95, м/с | скачок скорости между кадрами, p99 / макс, м/с² "
-        "| путь, м (цель) |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| ускорение по траектории, медиана / p95 / макс, м/с² | путь, м (цель) |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, m in metrics.items():
         b = m["bias_m"]
         k = m.get("kinematics")
         kin = (f"{k['speed_max_mps']:.1f} | {k['speed_error_mps']['median']:.2f} / {k['speed_error_mps']['p95']:.2f} "
                f"| {k['speed_change_p99_mps2']:.1f} / {k['speed_change_max_mps2']:.1f} "
-               f"| {k['path_m']:.0f} ({k['target_path_m']:.0f})") if k else "— | — | — | —"
+               f"| {k['trajectory_accel_mps2']['median']:.1f} / {k['trajectory_accel_mps2']['p95']:.1f} / "
+               f"{k['trajectory_accel_mps2']['max']:.0f} "
+               f"| {k['path_m']:.0f} ({k['target_path_m']:.0f})") if k else "— | — | — | — | —"
         title = f"**{METHOD_NAMES[name]}**" if name == MAIN_METHOD else METHOD_NAMES[name]
         lines.append(f"| {title} | {m['frames']} | {_fmt(m['position_m'])} | {_fmt(m['position_without_bias_m'])} "
                      f"| {b['along_m']:+.2f} / {b['cross_m']:+.2f} / {b['vertical_m']:+.2f} | {kin} |")
@@ -448,7 +464,10 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
     status = rt.array("status")
     since = rt.array("frames_since_measurement")
     lines += ["", f"Скорость цели по CSV: максимум ≈ 32 м/с; скачок скорости между кадрами p99 "
-              f"{c['target_speed_change_p99']:.1f} м/с².", "",
+              f"{c['target_speed_change_p99']:.1f} м/с²; ускорение по траектории CSV (вторая разность, с шумом "
+              f"округления CSV) медиана / p95 {c['target_trajectory_accel']['median']:.1f} / "
+              f"{c['target_trajectory_accel']['p95']:.1f} м/с². «Скачок скорости» у трекера считается по его "
+              "скорости и не видит сдвигов положения поправкой; «ускорение по траектории» — видит.", "",
               "## Реальное время: статусы кадров", "",
               f"Время на кадр: {c['realtime']['ms_per_frame']:.1f} мс (вместе с чтением поз камер).", "",
               "| статус | кадров | что значит |", "|---|---|---|",
