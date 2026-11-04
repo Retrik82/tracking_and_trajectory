@@ -1,0 +1,28 @@
+{
+  "cameras": {
+    "ids": [1, 2, 3, 4, 5],
+    "live_sources": {
+      "1": "rtsp://логин:пароль@10.0.0.11:554/stream1",
+      "2": "rtsp://логин:пароль@10.0.0.12:554/stream1",
+      "3": "rtsp://логин:пароль@10.0.0.13:554/stream1",
+      "4": "rtsp://логин:пароль@10.0.0.14:554/stream1",
+      "5": "rtsp://логин:пароль@10.0.0.15:554/stream1"
+    },
+    "fps": 30.0
+  },
+  "streaming": {
+    "mode": "live",
+    "queue_size": 2,
+    "sync_tolerance_ms": 20.0,
+    "max_frame_age_ms": 150.0,
+    "log_every": 100
+  },
+  "triangulation": {
+    "mode": "none"
+  },
+  "output": {
+    "out_dir": "outputs/live",
+    "plots": false,
+    "video": false
+  }
+}

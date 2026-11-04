@@ -75,6 +75,25 @@ python main.py --data tmp/synthetic --out outputs/synthetic --no-video
 (см. `docs/results/demo/`). Все параметры —
 `pipeline/config.py` (`--set раздел.ключ=значение`), число камер — `cameras.ids`.
 
+### Производительность: бэкенды, автонастройка
+
+Детектор поддерживает бэкенды `torch` / `onnx` / `openvino` (`detector.backend`;
+экспорт из `.pt` делается один раз и кэшируется в `models/`). На CPU разница в разы — см.
+[docs/HARDWARE_PROFILE.md](docs/HARDWARE_PROFILE.md) и
+[docs/PERFORMANCE_REPORT.md](docs/PERFORMANCE_REPORT.md).
+
+```bash
+python tools/benchmark_hardware.py --md docs/HARDWARE_PROFILE.md   # осмотр железа (без весов)
+python stream.py replay --data D:\project2 --auto-tune             # калибровка: выбор бэкенда, imgsz,
+                                                                   # бюджета изображений; профиль в configs/
+python stream.py live --config configs/live.json --auto-config     # запуск с сохранённым профилем
+```
+
+Бюджет `streaming.max_images_per_tick` ограничивает YOLO-изображения на тик (лишние активные
+камеры обходятся по кругу) — задержка не растёт бесконтрольно даже на слабом CPU. Ручные
+`--set` всегда сильнее профиля. Подробности: [docs/PRODUCTION_ARCHITECTURE.md](docs/PRODUCTION_ARCHITECTURE.md),
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 ## Как обрабатывается видео
 
 ```

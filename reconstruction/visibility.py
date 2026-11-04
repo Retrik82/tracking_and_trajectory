@@ -583,12 +583,22 @@ class CabTracker:
             p = self._mono_point(cameras[reliable[0][0]], reliable[0])
             if p is not None:
                 self._mono_buffer.append((frame, p))
-        window = 3 * self.s.init_frames
+        # Разреженные тики (бюджет YOLO на слабом CPU): стерео-точки приходят раз в несколько
+        # кадров, и окно в 3·init_frames КАДРОВ не вмещает init_frames точек по построению.
+        # Окно и требуемое число точек адаптируются к фактическому шагу измерений; при полном
+        # темпе (шаг ≤ 2 кадра) поведение в точности прежнее. Линейность на окне ~2 с терпима:
+        # инициализация лишь сеет фильтр (СКО позиции 4 м), дальше правят обычные обновления.
+        gaps = np.diff([f for f, _ in self._init_buffer]) if len(self._init_buffer) >= 2 else []
+        spacing = float(np.median(gaps)) if len(gaps) else 1.0
+        if spacing <= 2.0:
+            window, needed = 3 * self.s.init_frames, self.s.init_frames
+        else:
+            window, needed = int(np.ceil(2.0 * self.s.fps)), max(4, self.s.init_frames // 2)
         self._init_buffer = [(f, p) for f, p in self._init_buffer if frame - f < window]
         self._mono_buffer = [(f, p) for f, p in self._mono_buffer if frame - f < window]
         mono = False
         buffer = self._init_buffer
-        if len(buffer) < self.s.init_frames:
+        if len(buffer) < needed:
             if not allow_mono or self._init_buffer or len(self._mono_buffer) < 2 * self.s.init_frames:
                 return False
             buffer, mono = self._mono_buffer, True
@@ -612,7 +622,7 @@ class CabTracker:
             resid = np.linalg.norm(A @ coef - points, axis=1)
             keep = resid <= max(3.0 * np.median(resid), 2.0 * self.s.units_per_meter)
             if keep.sum() < len(frames):
-                if keep.sum() < max(3, self.s.init_frames // 2):
+                if keep.sum() < max(3, needed // 2):
                     self._init_buffer = [b for b, k in zip(self._init_buffer, keep) if k]
                     return False
                 coef = np.linalg.lstsq(A[keep], points[keep], rcond=None)[0]
@@ -702,10 +712,13 @@ class CabTracker:
         if lat_norm > lat_max:
             lateral = lateral * lat_max / lat_norm
         out[3:6] = previous_velocity + longitudinal * direction + lateral
+        # предел — «на кадр» (имя параметра): при разреженных тиках (dt кадров за шаг) ёмкость
+        # коррекции масштабируется на dt, иначе фильтр не успевает за накопленной ошибкой прогноза
         shift = out[:3] - prior[:3]
         norm = np.linalg.norm(shift)
-        if norm > s.max_correction_per_frame * pos_relax:
-            out[:3] = prior[:3] + shift * s.max_correction_per_frame * pos_relax / norm
+        max_shift = s.max_correction_per_frame * pos_relax * max(dt, 1.0)
+        if norm > max_shift:
+            out[:3] = prior[:3] + shift * max_shift / norm
         if self.n == 9:
             a_max = max(s.max_longitudinal_mps2, s.max_lateral_mps2) * s.accel_to_units
             a_norm = np.linalg.norm(out[6:9])

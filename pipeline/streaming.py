@@ -135,16 +135,21 @@ class VideoSource(FrameSource):
         super().__init__(camera, queue_size, lossless=not pacing and not live)
         self.source, self.fps, self.t0, self.pacing, self.live, self.max_frames = source, fps, t0, pacing, live, max_frames
 
+    RECONNECT_DELAY_S = 2.0          # live: пауза перед повторным подключением источника
+    RECONNECT_ATTEMPTS = 30          # live: попыток подряд до окончательного отключения камеры
+
     def _run(self) -> None:
         import cv2
 
         cap = cv2.VideoCapture(self.source)
+        failures = 0
         if not cap.isOpened():
             log.error("cam%d: не открыть источник %s", self.camera, self.source)
-            with self._cv:
-                self.done = True
-                self._cv.notify_all()
-            return
+            if not self.live:
+                with self._cv:
+                    self.done = True
+                    self._cv.notify_all()
+                return
         index = 0
         while not self._stop.is_set():
             if self.max_frames is not None and index >= self.max_frames:
@@ -154,9 +159,24 @@ class VideoSource(FrameSource):
                 delay = due - time.perf_counter()
                 if delay > 0:
                     time.sleep(delay)
-            ok, img = cap.read()
+            ok, img = cap.read() if cap.isOpened() else (False, None)
             if not ok:
-                break
+                if not self.live:
+                    break                        # файл закончился
+                # живой источник пропал: переподключение с паузой, камера не теряется навсегда
+                failures += 1
+                if failures > self.RECONNECT_ATTEMPTS:
+                    log.error("cam%d: источник %s недоступен после %d попыток — камера отключена",
+                              self.camera, self.source, failures - 1)
+                    break
+                log.warning("cam%d: потерян источник, переподключение %d/%d через %.0f с",
+                            self.camera, failures, self.RECONNECT_ATTEMPTS, self.RECONNECT_DELAY_S)
+                cap.release()
+                if self._stop.wait(self.RECONNECT_DELAY_S):
+                    break
+                cap = cv2.VideoCapture(self.source)
+                continue
+            failures = 0
             now = time.perf_counter()
             ts = (now - self.t0) if self.live else index / self.fps
             self.push(Frame(self.camera, index, ts, img, now))
@@ -308,32 +328,44 @@ class PrecomputedDetector:
 
 
 class YoloAdapter:
-    """YOLO (ultralytics) пакетно по кадрам активных камер."""
+    """YOLO (ultralytics) пакетно по кадрам активных камер; бэкенд — detection/yolo.py."""
 
     def __init__(self, cfg):
         from detection.yolo import YoloDetector, YoloSettings
 
+        if cfg.threads:
+            import torch
+
+            torch.set_num_threads(int(cfg.threads))
         self.detector = YoloDetector(YoloSettings(weights_path=Path(cfg.weights), imgsz=cfg.imgsz, conf=cfg.conf,
-                                                  device=cfg.device, min_mask_area_px=cfg.min_mask_area_px,
+                                                  device=cfg.device, backend=cfg.backend, half=cfg.half,
+                                                  retina_masks=cfg.retina_masks,
+                                                  min_mask_area_px=cfg.min_mask_area_px,
                                                   min_reliable_conf=cfg.min_reliable_conf,
                                                   edge_margin_px=cfg.edge_margin_px))
+        log.info("детектор: бэкенд %s, устройство %s, imgsz %d, retina_masks %s",
+                 self.detector.backend, self.detector.device, cfg.imgsz, cfg.retina_masks)
         self.cfg = cfg
         self.calls = 0
         self.images = 0
         self.polygons: dict[tuple[int, int], np.ndarray] = {}
+
+    def warmup(self, height: int, width: int) -> None:
+        """Первый инференс (загрузка и компиляция модели) — до старта потока."""
+        t0 = time.perf_counter()
+        blank = np.zeros((height, width, 3), dtype=np.uint8)
+        self.detector.detect_images([blank, blank])
+        log.info("прогрев детектора: %.1f с", time.perf_counter() - t0)
 
     def detect(self, frames: list[Frame]) -> dict[int, Detection | None]:
         if not frames:
             return {}
         self.calls += 1
         self.images += len(frames)
-        d = self.detector
-        results = d.model.predict(source=[f.image for f in frames], imgsz=self.cfg.imgsz, conf=self.cfg.conf,
-                                  classes=[d.class_id], device=d.device, half=self.cfg.half, retina_masks=True,
-                                  verbose=False)
+        results = self.detector.detect_images([f.image for f in frames], [f.camera for f in frames],
+                                              [f.index for f in frames])
         out = {}
-        for f, res in zip(frames, results):
-            fr = d._convert(res, f.camera, f.index)
+        for f, fr in zip(frames, results):
             out[f.camera] = fr.detection
             if fr.polygon is not None:
                 self.polygons[(f.camera, f.index)] = fr.polygon
@@ -546,6 +578,24 @@ class StreamPipeline:
         self.finished_at = float("nan")
         self.last_estimate = None
         self._prev_t = None
+        self._last_run: dict[int, int] = {}      # камера -> тик последнего запуска детектора (бюджет)
+        self._last_found: dict[int, int] = {}    # камера -> тик последней найденной детекции
+
+    EXPLORE_EVERY = 5                            # каждый N-й тик один слот бюджета — разведка
+
+    def _select_within_budget(self, frames: list, budget: int, index: int) -> list:
+        """
+        Какие камеры детектировать при бюджете: якорим камеры, недавно находившие объект
+        (стабильная стерео-пара — иначе фильтр не инициализируется), а каждый EXPLORE_EVERY-й
+        тик последний слот отдаём давно не проверявшейся камере (разведка).
+        """
+        ranked = sorted(frames, key=lambda f: self._last_found.get(f.camera, -1), reverse=True)
+        chosen = ranked[:budget]
+        if budget >= 2 and index % self.EXPLORE_EVERY == 0:
+            rest = sorted((f for f in ranked[budget:]), key=lambda f: self._last_run.get(f.camera, -1))
+            if rest:
+                chosen[-1] = rest[0]
+        return chosen
 
     # --- позы камер
     def _pose_from_csv(self, cam: int, index: int) -> Camera:
@@ -564,6 +614,15 @@ class StreamPipeline:
     # --- источники
     def _make_sources(self) -> None:
         c, s = self.cfg.cameras, self.cfg.streaming
+        if self.detector is None:
+            if s.mode == "detections":
+                self.detector = PrecomputedDetector(self.detections, polygons=self.polygons)
+            else:
+                self.detector = YoloAdapter(self.cfg.detector)
+        # прогрев до назначения t0 и старта захвата: первый вызов (загрузка/компиляция модели)
+        # занимает секунды и не должен съедать реальное время потока и задерживать инициализацию
+        if hasattr(self.detector, "warmup"):
+            self.detector.warmup(c.height, c.width)
         t0 = time.perf_counter() + 0.2
         for cam in c.ids:
             if s.mode == "detections":
@@ -587,11 +646,6 @@ class StreamPipeline:
                 self.sources[cam] = VideoSource(cam, src, c.fps, t0, False, s.queue_size, live=True)
             else:
                 raise ValueError(f"неизвестный режим {s.mode}")
-        if self.detector is None:
-            if s.mode == "detections":
-                self.detector = PrecomputedDetector(self.detections, polygons=self.polygons)
-            else:
-                self.detector = YoloAdapter(self.cfg.detector)
         for src in self.sources.values():
             src.start()
 
@@ -609,10 +663,18 @@ class StreamPipeline:
         plan = self.scheduler.plan(index, snapshot, cams_pose)
         self.timer.add("scheduler", (time.perf_counter() - t_s) * 1000)
 
-        # детекция
+        # детекция (с бюджетом изображений на тик)
         t_s = time.perf_counter()
         to_run = [bundle.frames[cam] for cam in plan.to_run if cam in bundle.frames]
+        budget = cfg.streaming.max_images_per_tick
+        if budget is not None and len(to_run) > budget > 0:
+            to_run = self._select_within_budget(to_run, budget, index)
+        for f in to_run:
+            self._last_run[f.camera] = index
         dets = self.detector.detect(to_run) if to_run else {}
+        for f in to_run:
+            if dets.get(f.camera) is not None:
+                self._last_found[f.camera] = index
         self.timer.add("detection", (time.perf_counter() - t_s) * 1000)
 
         # измерения
@@ -635,9 +697,10 @@ class StreamPipeline:
         est._timestamp_s = t
         self.last_estimate = est
         self.timer.add("tracker", (time.perf_counter() - t_s) * 1000)
-        # обратная связь планировщику: отброшенная гейтом рамка — не «нашла объект»
-        self.scheduler.observe(index, {cam: dets.get(cam) is not None and cam not in est.rejected_cameras
-                                       for cam in plan.to_run if cam in bundle.frames})
+        # обратная связь планировщику: отброшенная гейтом рамка — не «нашла объект»;
+        # камеры, срезанные бюджетом изображений, в этот тик не наблюдались вовсе
+        self.scheduler.observe(index, {f.camera: dets.get(f.camera) is not None
+                                       and f.camera not in est.rejected_cameras for f in to_run})
 
         # сплайн
         smoothed = None
@@ -702,6 +765,8 @@ class StreamPipeline:
                              r.active_cameras, r.latency_ms)
                 if s.max_frames is not None and ticks >= s.max_frames:
                     break
+        except KeyboardInterrupt:
+            log.info("остановка по Ctrl+C: закрываю источники и сохраняю результаты (%d тиков)", ticks)
         finally:
             self.finished_at = time.perf_counter()
             for src in self.sources.values():
@@ -968,12 +1033,36 @@ def main(argv=None) -> None:
     p.add_argument("--num-frames", type=int, default=None, help="режим detections: число кадров (по умолчанию из CSV)")
     p.add_argument("--video", action="store_true", help="писать видео с наложением (replay/live)")
     p.add_argument("--no-pacing", action="store_true", help="replay: без ожидания исходного темпа (как можно быстрее)")
+    p.add_argument("--auto-tune", action="store_true",
+                   help="калибровка под этот компьютер: замер бэкендов и размеров, сохранение "
+                        "configs/performance_profile.json, запуск с выбранными параметрами")
+    p.add_argument("--auto-config", action="store_true",
+                   help="применить сохранённый профиль производительности (с проверкой железа)")
+    p.add_argument("--min-imgsz", type=int, default=640, help="auto-tune: нижний предел размера (качество)")
     p.add_argument("--print-config", action="store_true")
     args = p.parse_args(argv)
     if args.print_config:
         print(StreamConfig.default_json())
         return
-    cfg = StreamConfig.load(args.config, args.set)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = StreamConfig.load(args.config, [])
+    if args.auto_tune or args.auto_config:
+        from pipeline import autotune
+
+        if args.auto_tune:
+            profile = autotune.run_auto_tune(cfg, min_imgsz=args.min_imgsz)
+        else:
+            profile = autotune.load_profile()
+            mismatches = autotune.check_signature(profile)
+            if mismatches:
+                log.warning("профиль снят на другом оборудовании (%s) — перекалибруйте с --auto-tune",
+                            "; ".join(mismatches))
+        autotune.apply_profile(cfg, profile)
+    from pipeline.config import _set_nested
+
+    for item in args.set:                       # ручные настройки сильнее автоматических
+        key, _, value = item.partition("=")
+        _set_nested(cfg, key.strip(), value.strip())
     if args.mode:
         cfg.streaming.mode = args.mode
     if args.out:
@@ -982,7 +1071,6 @@ def main(argv=None) -> None:
         cfg.output.video = True
     if args.no_pacing:
         cfg.streaming.realtime_pacing = False
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     detections, num, detector, polygons = None, None, None, None
     if cfg.streaming.mode == "detections":
         det_dir = args.detections or (Path(cfg.output.out_dir) / "detections")
