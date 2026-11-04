@@ -614,18 +614,25 @@ class CabTracker:
             gaps = np.diff([f for f, _ in buf]) if len(buf) >= 2 else []
             return float(np.median(gaps)) if len(gaps) else 1.0
 
+        def sparse_window(needed_pts: float, step: float) -> int:
+            # окно должно вмещать needed точек при фактическом шаге с запасом на промахи
+            # детектора (×1.6), но не длиннее 4 с — дальше линейная модель буфера не годится
+            return int(np.ceil(min(4.0 * self.s.fps, 1.6 * needed_pts * step)))
+
         spacing = cadence(self._init_buffer)
         if spacing <= 2.0:
             window, needed = 3 * self.s.init_frames, self.s.init_frames
         else:
-            window, needed = int(np.ceil(2.0 * self.s.fps)), max(4, self.s.init_frames // 2)
+            needed = max(4, self.s.init_frames // 2)
+            window = sparse_window(needed, spacing)
         # моно-буфер: тот же принцип — при полном темпе прежние 2·init_frames точек,
         # при редких тиках порог и окно, достижимые при фактическом шаге измерений
         mono_spacing = cadence(self._mono_buffer)
         if mono_spacing <= 2.0:
             mono_window, mono_needed = window, 2 * self.s.init_frames
         else:
-            mono_window, mono_needed = int(np.ceil(2.0 * self.s.fps)), max(4, self.s.init_frames // 2)
+            mono_needed = max(4, self.s.init_frames // 2)
+            mono_window = sparse_window(mono_needed, mono_spacing)
         self._init_buffer = [(f, p) for f, p in self._init_buffer if frame - f < window]
         self._mono_buffer = [(f, p) for f, p in self._mono_buffer if frame - f < mono_window]
         mono = False
