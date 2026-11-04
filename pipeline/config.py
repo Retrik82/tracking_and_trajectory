@@ -159,6 +159,7 @@ class TrackerConfig:
     init_frames: int = 8
     mono_init: bool = False                    # старт по одной камере (грубо, quality = mono); см. visibility.py
     use_edges: bool = True                     # измерение по рёбрам рамки проекции модели
+    occlusion_size_ratio: float = 0.0          # рамка уже проекции модели в столько раз — край срезан (0 — выкл.)
     occlusion_hold_frames: int = 3             # гистерезис закрытых рёбер: удержание решения, кадров (0 — выкл.)
     occlusion_ramp_frames: int = 8             # затем плавный возврат веса ребра за столько кадров
     truck_fbx: str = "models/CargoTruck.fbx"

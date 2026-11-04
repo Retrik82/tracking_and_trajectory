@@ -201,6 +201,10 @@ class TrackerSettings:
     mono_depth_shape_tol: float = 0.15             # |w-ratio − h-ratio| / ratio больше — рамка искажена, дальности нет
     lost_after_frames: int = 90                    # столько кадров только прогноза — уровень «потерян»
     # Подгонка модели к контуру масок ≥2 камер (reconstruction/silhouette_fit.py): измерение (x, y) и курса
+    # Срезанная рамка по размеру: рамка камеры уже (ниже) проекции модели больше чем в size_ratio раз — край
+    # срезан перекрытием; срезанным считается ребро, сильнее отклонившееся от прогноза (отставание прогноза сдвигает
+    # оба ребра одинаково, перекрытие — одно). 0 — выключено
+    occlusion_size_ratio: float = 0.0
     silhouette_fit: bool = False
     # measure — (x, y) и курс в фильтр; heading — только курс; output — фильтр как без подгонки, а точка вывода
     # на кадре берётся из подгонки к контуру (начальное приближение — оценка фильтра), если она удалась
@@ -768,6 +772,21 @@ class CabTracker:
                                        self.dims)
     # ---------------------------------------------------------------- доработка: вспомогательные измерения
 
+    def _size_cut_edges(self, predicted: np.ndarray, observed: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        """Рёбра (M, 4), срезанные перекрытием, по отношению размеров рамки детектора и прогнозной рамки."""
+        out = np.zeros_like(valid)
+        r = self.s.occlusion_size_ratio
+        for i in range(len(observed)):
+            for a, b in ((0, 1), (2, 3)):
+                pw, ow = predicted[i, b] - predicted[i, a], observed[i, b] - observed[i, a]
+                if pw <= 0 or ow >= r * pw:
+                    continue
+                da, db = observed[i, a] - predicted[i, a], predicted[i, b] - observed[i, b]   # внутрь — положительно
+                k = a if da > db else b
+                if valid[i, k]:
+                    out[i, k] = True
+        return out
+
     def _silhouette_update(self, cameras, detections, prior, P_prior, valid, occluded, rejected):
         """
         Подгонка модели к контуру чистых масок (≥2 камер). Курс исправляется сразу (скалярный фильтр, гейт),
@@ -1077,6 +1096,12 @@ class CabTracker:
             occluded_count = int((valid & (edge_weight == 0) & ~rejected[:, None]).sum())
             any_occluded = bool(occluded.any() or rejected.any())
             clean_out = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
+            if s.occlusion_size_ratio > 0:
+                cut = self._size_cut_edges(predicted, observed, valid) & usable
+                if cut.any() and ((usable & ~cut).sum(axis=1) >= 3).sum() >= 1:
+                    usable = usable & ~cut
+                    occluded = occluded | cut
+                    occluded_count += int(cut.sum())
             used_cameras = int((usable.sum(axis=1) >= 3).sum())
 
             if s.visual_heading:
@@ -1119,53 +1144,55 @@ class CabTracker:
                     for d in detections])
                 inflate = np.array([s.edge_inflation_with_point if point_used and c in point.cameras else 1.0
                                     for c in cam_ids])
-                mask = usable.ravel()
-                observed_flat = observed.ravel()[mask]
-                R_edges = (np.repeat(s.edge_sigma_px / np.sqrt(conf * ramp) * np.sqrt(inflate), 4) ** 2
-                           / np.maximum(edge_weight.ravel(), 1e-6))[mask]
-                # систематические источники в квадратуре: несовпадение модели и силуэта, калибровка камеры
-                R_edges = R_edges + s.model_sigma_px ** 2 + s.calibration_sigma_px ** 2
-                if s.heading_in_edges and mask.any():
-                    # неопределённость курса: (∂ребро/∂курс)² · σ²_курса
-                    dh = np.radians(2.0)
-                    rot = np.array([np.cos(self.heading + dh), np.sin(self.heading + dh), direction[2]])
-                    rot /= np.linalg.norm(rot)
-                    d_edges = (self._measure(prior[:3], rot, geometry) - self._measure(prior[:3], direction, geometry))
-                    R_edges = R_edges + (d_edges.ravel()[mask] / dh) ** 2 * self._heading_var_report
-                P_inv = np.linalg.inv(P_prior)
-                measure = lambda x: self._measure(x[:3], direction, geometry).ravel()[mask]  # noqa: E731
-                n_edges = int(mask.sum())
-                H_point = np.zeros((3, self.n))
-                H_point[:, :3] = np.eye(3)
-                R_point_inv = np.linalg.inv(point.covariance) if point_used else None
-                aux_inv = [(fn, np.linalg.inv(R)) for _, fn, R in aux]
-                state = prior.copy()
-                for _ in range(max(1, s.update_iterations)):
-                    information = P_inv.copy()
-                    gradient = np.zeros(self.n)
-                    if n_edges:
-                        Hm = np.zeros((n_edges, self.n))
-                        steps = np.zeros(self.n)
-                        steps[:3] = 1.0
-                        Hm[:, :3] = _numeric_jacobian(measure, state, steps)[:, :3]
-                        residual = observed_flat - measure(state)
-                        S_diag = np.einsum("ij,jk,ik->i", Hm, P_prior, Hm) + R_edges
-                        R = R_edges * np.maximum(1.0, np.abs(residual) / np.sqrt(S_diag) / s.huber_k)
-                        information += Hm.T @ (Hm / R[:, None])
-                        gradient += Hm.T @ ((residual + Hm @ (state - prior)) / R)
-                    if point_used:
-                        residual_p = point.point - state[:3]
-                        information += H_point.T @ R_point_inv @ H_point
-                        gradient += H_point.T @ R_point_inv @ (residual_p + H_point @ (state - prior))
-                    for fn, R_inv in aux_inv:
-                        residual_a, H_a = fn(state)
-                        information += H_a.T @ R_inv @ H_a
-                        gradient += H_a.T @ R_inv @ (residual_a + H_a @ (state - prior))
-                    new_state = prior + np.linalg.solve(information, gradient)
-                    converged = np.max(np.abs(new_state[:3] - state[:3])) < 1.0
-                    state = new_state
-                    if converged:
-                        break
+                for _ in range(1):
+                    mask = usable.ravel()
+                    observed_flat = observed.ravel()[mask]
+                    R_edges = (np.repeat(s.edge_sigma_px / np.sqrt(conf * ramp) * np.sqrt(inflate), 4) ** 2
+                               / np.maximum(edge_weight.ravel(), 1e-6))[mask]
+                    # систематические источники в квадратуре: несовпадение модели и силуэта, калибровка камеры
+                    R_edges = R_edges + s.model_sigma_px ** 2 + s.calibration_sigma_px ** 2
+                    if s.heading_in_edges and mask.any():
+                        # неопределённость курса: (∂ребро/∂курс)² · σ²_курса
+                        dh = np.radians(2.0)
+                        rot = np.array([np.cos(self.heading + dh), np.sin(self.heading + dh), direction[2]])
+                        rot /= np.linalg.norm(rot)
+                        d_edges = (self._measure(prior[:3], rot, geometry) - self._measure(prior[:3], direction, geometry))
+                        R_edges = R_edges + (d_edges.ravel()[mask] / dh) ** 2 * self._heading_var_report
+                    P_inv = np.linalg.inv(P_prior)
+                    measure = lambda x: self._measure(x[:3], direction, geometry).ravel()[mask]  # noqa: E731
+                    n_edges = int(mask.sum())
+                    H_point = np.zeros((3, self.n))
+                    H_point[:, :3] = np.eye(3)
+                    R_point_inv = np.linalg.inv(point.covariance) if point_used else None
+                    aux_inv = [(fn, np.linalg.inv(R)) for _, fn, R in aux]
+                    state = prior.copy()
+                    for _ in range(max(1, s.update_iterations)):
+                        information = P_inv.copy()
+                        gradient = np.zeros(self.n)
+                        if n_edges:
+                            Hm = np.zeros((n_edges, self.n))
+                            steps = np.zeros(self.n)
+                            steps[:3] = 1.0
+                            Hm[:, :3] = _numeric_jacobian(measure, state, steps)[:, :3]
+                            residual = observed_flat - measure(state)
+                            S_diag = np.einsum("ij,jk,ik->i", Hm, P_prior, Hm) + R_edges
+                            R = R_edges * np.maximum(1.0, np.abs(residual) / np.sqrt(S_diag) / s.huber_k)
+                            information += Hm.T @ (Hm / R[:, None])
+                            gradient += Hm.T @ ((residual + Hm @ (state - prior)) / R)
+                        if point_used:
+                            residual_p = point.point - state[:3]
+                            information += H_point.T @ R_point_inv @ H_point
+                            gradient += H_point.T @ R_point_inv @ (residual_p + H_point @ (state - prior))
+                        for fn, R_inv in aux_inv:
+                            residual_a, H_a = fn(state)
+                            information += H_a.T @ R_inv @ H_a
+                            gradient += H_a.T @ R_inv @ (residual_a + H_a @ (state - prior))
+                        new_state = prior + np.linalg.solve(information, gradient)
+                        converged = np.max(np.abs(new_state[:3] - state[:3])) < 1.0
+                        state = new_state
+                        if converged:
+                            break
+                    break
                 P = np.linalg.inv(information)
                 P = (P + P.T) / 2
                 unclipped = state

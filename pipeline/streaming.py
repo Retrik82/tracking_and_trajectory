@@ -588,6 +588,7 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
         vertical_accel_noise_mps2=t.vertical_accel_noise_mps2, jerk_noise_mps3=t.jerk_noise_mps3,
         use_edges=t.use_edges, edge_sigma_px=t.edge_sigma_px, huber_k=t.huber_k,
         occlusion_hold_frames=t.occlusion_hold_frames, occlusion_ramp_frames=t.occlusion_ramp_frames,
+        occlusion_size_ratio=t.occlusion_size_ratio,
         max_longitudinal_mps2=t.max_longitudinal_mps2, max_lateral_mps2=t.max_lateral_mps2,
         max_correction_per_frame=t.max_correction_per_frame_m * c.units_per_meter,
         heading_rate_limit_dps=t.heading_rate_limit_dps, min_heading_speed_mps=t.heading_min_speed_mps,

@@ -10,7 +10,8 @@
   },
   "tracker": {
     "heading_rate_limit_dps": 1000000000.0,
-    "occlusion_hold_frames": 0
+    "occlusion_hold_frames": 0,
+    "occlusion_size_ratio": 0.8
   },
   "orientation": {
     "enabled": true

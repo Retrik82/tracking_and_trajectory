@@ -74,6 +74,8 @@ VARIANTS["REC"] = ("A + рекомендуемые доработки (O, H, R, 
                    {**_A, **{k: v for key, (_, o) in UPGRADE_COMPONENTS.items() if key != "M" for k, v in o.items()}})
 VARIANTS["REC+S"] = ("REC + курс по подгонке модели к контуру масок ≥2 камер (silhouette_fit)",
                      {**VARIANTS["REC"][1], "silhouette.enabled": True, "silhouette.mode": "heading"})
+VARIANTS["BEST"] = ("REC+S + отсев рамок, срезанных перекрытием (по размеру против модели)",
+                    {**VARIANTS["REC+S"][1], "tracker.occlusion_size_ratio": 0.8})
 SMOOTHED_VARIANTS = {"D", "E"}
 SEGMENTS = {"одна камера 200–300": (200, 300), "медленный поворот 650–850": (650, 850)}
 

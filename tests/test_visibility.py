@@ -368,3 +368,15 @@ def test_camera_seen_on_every_tick_is_not_reappearing_when_ticks_skip_frames():
                  points.get((int(data.camera_indices[i]), f)), True) for i in by_frame[f]]
         tracker.step(f, {d[0]: provider(d[0], f) for d in dets}, dets, dt_frames=3.0)
     assert all(v == 0 for v in tracker._appeared.values())
+
+
+def test_size_cut_edge_is_detected_even_when_prediction_lags():
+    """Рамка вдвое уже модели: срезано ребро, отклонившееся сильнее (отставание прогноза сдвигает оба ребра)."""
+    tracker = CabTracker(TrackerSettings(occlusion_size_ratio=0.8), DIMS)
+    predicted = np.array([[100.0, 400.0, 200.0, 300.0]])
+    lag = 30.0                                            # прогноз отстаёт: обе стороны сдвинуты на 30 px
+    observed = np.array([[100.0 + lag + 150.0, 400.0 + lag, 200.0, 300.0]])   # левая часть закрыта
+    cut = tracker._size_cut_edges(predicted, observed, np.ones((1, 4), bool))
+    assert cut.tolist() == [[True, False, False, False]]
+    whole = np.array([[100.0 + lag, 400.0 + lag, 200.0, 300.0]])
+    assert not tracker._size_cut_edges(predicted, whole, np.ones((1, 4), bool)).any()
