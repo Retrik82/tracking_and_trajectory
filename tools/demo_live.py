@@ -286,21 +286,22 @@ def main(argv=None):
         target = None
     source.start()
 
-    # масштаб — по траектории (эталон только задаёт рамку картинки); камеры за рамкой не рисуются
+    # рамка карты — все камеры и траектория (эталон только задаёт рамку картинки); сверху место под подпись
+    pts = [make_camera(args.data, c, 0).position[:2] for c in cams_ids]
     if target is not None:
-        pts = np.array(target.positions[target.valid][:, :2])
-    else:
-        pts = np.array([make_camera(args.data, c, 0).position[:2] for c in cams_ids])
+        pts += list(target.positions[target.valid][:, :2])
+    pts = np.array(pts)
     lo, hi = pts.min(0), pts.max(0)
-    pad = 0.08 * (hi - lo)
+    pad = 0.06 * (hi - lo) + 1500.0                  # запас под значок камеры и подпись
     lo, hi = lo - pad, hi + pad
-    MAP = (640, 360)
+    MAP_TOP = 28
+    MAP = (640, 360 - MAP_TOP)
     k = min(MAP[0] / (hi[0] - lo[0]), MAP[1] / (hi[1] - lo[1]))
 
     def to_map(xy):
         xy = np.atleast_2d(xy)
         return np.c_[(xy[:, 0] - lo[0]) * k + (MAP[0] - (hi[0] - lo[0]) * k) / 2,
-                     MAP[1] - ((xy[:, 1] - lo[1]) * k + (MAP[1] - (hi[1] - lo[1]) * k) / 2)]
+                     MAP_TOP + MAP[1] - ((xy[:, 1] - lo[1]) * k + (MAP[1] - (hi[1] - lo[1]) * k) / 2)]
 
     f_big, f_mid, f_small = font(28), font(21), font(16)
     trail = deque(maxlen=90)
