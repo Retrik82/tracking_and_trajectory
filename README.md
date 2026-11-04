@@ -23,6 +23,7 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python main.py --steps realtime,compare --video   # только трекер, отчёт и видео
 .venv/bin/python main.py --redetect                        # пересчитать детекции (новые веса)
+.venv/bin/python main.py --detector classic --out outputs/classic   # без нейросети: вычитание фона
 .venv/bin/python main.py --help                            # все параметры
 ```
 
@@ -97,6 +98,8 @@ pipeline/
 detection/
   schema.py                 формат детекции (рамка, точка объекта, маска, ключевая точка, флаги)
   yolo.py                   YoloDetector: ultralytics импортируется только при использовании
+  classic.py                ClassicDetector: без нейросети — вычитание фона по известным позам камер
+                            (у вращающейся камеры фон — панорама по направлениям), --detector classic
 reconstruction/
   camera.py                 модель камеры проекта (forward/right/up из roll/pitch/yaw), чтение CSV камер
   data_io.py                пути, фокус из заголовка CSV, CSV цели с обнаружением испорченных ячеек
