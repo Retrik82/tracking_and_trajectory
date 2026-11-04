@@ -205,6 +205,13 @@ class TrackerSettings:
     # срезан перекрытием; срезанным считается ребро, сильнее отклонившееся от прогноза (отставание прогноза сдвигает
     # оба ребра одинаково, перекрытие — одно). 0 — выключено
     occlusion_size_ratio: float = 0.0
+    # Физический предел поворота для ИТОГОВОГО курса (включая поправки по силуэту и контуру, которые иначе
+    # обходят предел): за кадр не больше (v / R_min + heading_rate_floor) · dt. Без него курс на медленном повороте
+    # дёргался до 11°/кадр, а точка вывода в 11 м от центра прыгала на ~2 м. 0 — выключено
+    heading_output_rate_limit: bool = False
+    heading_rate_floor_dps: float = 5.0
+    heading_accel_limit_dps2: float = 0.0          # предел изменения скорости поворота (руль не перекладывается
+                                                   # мгновенно туда-обратно — убирает зигзаг курса), °/с²; 0 — выкл.
     silhouette_fit: bool = False
     # measure — (x, y) и курс в фильтр; heading — только курс; output — фильтр как без подгонки, а точка вывода
     # на кадре берётся из подгонки к контуру (начальное приближение — оценка фильтра), если она удалась
@@ -408,6 +415,8 @@ class CabTracker:
         self._visual_bias = 0.0                             # увод кузова от направления скорости по силуэту, рад
         self._bias_updated = False
         self._sf = SilhouetteFitSettings()
+        self._out_heading: float | None = None              # курс прошлого кадра (для предела поворота)
+        self._out_yaw_rate = 0.0                            # скорость поворота итогового курса, рад/кадр
         self._verified: set[int] = set()                    # камеры, чья детекция после появления согласовалась с треком
         self._yaw_rate = 0.0                                # рад/с, сглаженная
         self._heading_var_report = self.heading_var         # дисперсия курса с систематикой (для весов и вывода)
@@ -1247,6 +1256,23 @@ class CabTracker:
         self._prev_velocity = state[3:6].copy()
 
         direction = self._update_heading(state, dt)
+        if s.heading_output_rate_limit and self._out_heading is not None:
+            speed_ms = self._speed_mps(state)
+            rate = speed_ms / max(s.min_turn_radius_m, 0.1) + np.radians(s.heading_rate_floor_dps)
+            lim = rate / s.fps * max(dt, 1e-6)
+            delta = float(_wrap(self.heading - self._out_heading))
+            if s.heading_accel_limit_dps2 > 0:
+                dw = np.radians(s.heading_accel_limit_dps2) / s.fps ** 2 * max(dt, 1e-6) ** 2
+                delta = float(np.clip(delta, self._out_yaw_rate * dt - dw, self._out_yaw_rate * dt + dw))
+            delta = float(np.clip(delta, -lim, lim))
+            self._out_yaw_rate = delta / max(dt, 1e-6)
+            if delta != float(_wrap(self.heading - self._out_heading)):
+                self.heading = float(_wrap(self._out_heading + delta))
+                d = np.array([np.cos(self.heading), np.sin(self.heading), self.heading_dir[2]
+                              / max(np.hypot(*self.heading_dir[:2]), 1e-9)])
+                self.heading_dir = d / np.linalg.norm(d)
+                direction = self.heading_dir
+        self._out_heading = self.heading
         out_center, out_heading_cov = state[:3], None
         if s.silhouette_fit and s.silhouette_mode == "output" and detections:
             masks = {d[0]: d[6] for d, ok in zip(detections, clean_out) if ok and len(d) > 6 and d[6] is not None}

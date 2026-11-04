@@ -159,6 +159,9 @@ class TrackerConfig:
     init_frames: int = 8
     mono_init: bool = False                    # старт по одной камере (грубо, quality = mono); см. visibility.py
     use_edges: bool = True                     # измерение по рёбрам рамки проекции модели
+    heading_output_rate_limit: bool = False    # физический предел поворота для итогового курса (v / R_min)
+    min_turn_radius_m: float = 8.0
+    heading_accel_limit_dps2: float = 0.0      # предел углового ускорения итогового курса, °/с² (0 — выкл.)
     occlusion_size_ratio: float = 0.0          # рамка уже проекции модели в столько раз — край срезан (0 — выкл.)
     occlusion_hold_frames: int = 3             # гистерезис закрытых рёбер: удержание решения, кадров (0 — выкл.)
     occlusion_ramp_frames: int = 8             # затем плавный возврат веса ребра за столько кадров
