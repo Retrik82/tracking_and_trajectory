@@ -1,14 +1,16 @@
 """
 Демонстрация трекера реального времени: окно с пятью камерами одновременно, вид сверху и параметры.
 
-Видео всех камер воспроизводятся синхронно в исходном темпе (30 FPS); на каждом кадре трекер получает
-детекции ТОЛЬКО этого кадра и выдаёт оценку (причинно, без будущих кадров). Детекции YOLO посчитаны
-заранее (outputs/main/detections): на этом компьютере YOLO на пяти камерах не успевает за 30 FPS.
-Эталон CSV рисуется только для сравнения (в трекер не подаётся), и только до текущего кадра.
+По умолчанию — ЖИВАЯ детекция, без подготовки: видео всех камер идут по часам в реальном темпе (30 FPS),
+система каждый раз берёт самый свежий синхронный кадр, запускает детектор на пяти камерах, обновляет трекер
+и рисует результат. Кадры, которые не успели обработать, пропускаются (как с настоящими камерами): на этом
+Mac YOLO на пяти камерах ~80 мс (imgsz 640), классический детектор ~80 мс — обновлений ~10 в секунду.
+Трекер получает детекции только текущего кадра (причинно). Эталон CSV рисуется только для сравнения.
 
-    .venv/bin/python tools/demo_live.py                                   # REC (configs/upgrade_recommended.json)
-    .venv/bin/python tools/demo_live.py --config none                     # базовый вариант A
-    .venv/bin/python tools/demo_live.py --save outputs/demo_live.mp4      # ещё и записать
+    .venv/bin/python tools/demo_live.py                          # живая YOLO + трекер REC
+    .venv/bin/python tools/demo_live.py --live classic           # живой детектор без нейросети + REC
+    .venv/bin/python tools/demo_live.py --config none            # базовый трекер A
+    .venv/bin/python tools/demo_live.py --detections outputs/main/detections   # готовые детекции, каждый кадр
 
 Клавиши: пробел — пауза / продолжить, q или Esc — выход.
 """
@@ -66,6 +68,172 @@ class Reader(threading.Thread):
                 return
 
 
+class Clock:
+    """Часы воспроизведения: номер кадра видео, который «идёт» сейчас (с учётом пауз)."""
+
+    def __init__(self, fps: float):
+        self.fps = fps
+        self.t0 = time.perf_counter()
+        self.paused_at = None
+
+    def frame(self) -> float:
+        now = self.paused_at if self.paused_at is not None else time.perf_counter()
+        return (now - self.t0) * self.fps
+
+    def pause(self):
+        self.paused_at = time.perf_counter()
+
+    def resume(self):
+        if self.paused_at is not None:
+            self.t0 += time.perf_counter() - self.paused_at
+            self.paused_at = None
+
+
+class LiveReader(threading.Thread):
+    """Камера «в эфире»: декодирует каждый кадр в его момент времени, хранит последние несколько."""
+
+    def __init__(self, path: Path, clock: Clock, keep: int = 6):
+        super().__init__(daemon=True)
+        self.cap = cv2.VideoCapture(str(path))
+        self.clock, self.keep = clock, keep
+        self.frames: dict[int, np.ndarray] = {}
+        self.latest = -1
+        self.done = False
+        self.lock = threading.Lock()
+
+    def run(self):
+        idx = 0
+        while True:
+            while self.clock.frame() < idx:                   # кадр ещё «не снят»
+                time.sleep(0.002)
+            ok, img = self.cap.read()
+            if not ok:
+                self.done = True
+                return
+            with self.lock:
+                self.frames[idx] = img
+                self.frames.pop(idx - self.keep, None)
+                self.latest = idx
+            idx += 1
+
+
+class LiveSource:
+    """Самый свежий синхронный кадр всех камер; необработанные кадры пропускаются."""
+
+    def __init__(self, paths: dict[int, Path], fps: float):
+        self.clock = Clock(fps)
+        self.readers = {c: LiveReader(p, self.clock) for c, p in paths.items()}
+        self.last = -1
+        self.skipped = 0
+
+    def start(self):
+        self.clock = Clock(self.clock.fps)
+        for r in self.readers.values():
+            r.clock = self.clock
+            r.start()
+
+    def next(self):
+        while True:
+            if any(r.done for r in self.readers.values()):
+                return None
+            idx = min(r.latest for r in self.readers.values())
+            if idx > self.last:
+                break
+            time.sleep(0.002)
+        frames = {}
+        for c, r in self.readers.items():
+            with r.lock:
+                frames[c] = r.frames.get(idx)
+        if any(v is None for v in frames.values()):
+            self.last = idx
+            return self.next()
+        self.skipped += max(idx - self.last - 1, 0) if self.last >= 0 else idx
+        self.last = idx
+        return idx, frames
+
+
+class FileSource:
+    """Все кадры по порядку (для готовых детекций): темп задаёт главный цикл."""
+
+    def __init__(self, paths: dict[int, Path]):
+        self.readers = {c: Reader(p) for c, p in paths.items()}
+        self.idx = -1
+        self.skipped = 0
+
+    def start(self):
+        for r in self.readers.values():
+            r.start()
+
+    def next(self):
+        frames = {c: r.q.get() for c, r in self.readers.items()}
+        if any(v is None for v in frames.values()):
+            return None
+        self.idx += 1
+        return self.idx, frames
+
+
+class YoloLive:
+    def __init__(self, weights: Path, imgsz: int, conf: float):
+        from detection.yolo import YoloDetector, YoloSettings
+
+        self.d = YoloDetector(YoloSettings(weights_path=weights, imgsz=imgsz, conf=conf))
+        self.imgsz, self.conf = imgsz, conf
+        self.name = f"YOLO вживую, imgsz {imgsz}"
+
+    def detect(self, idx, frames):
+        cams = list(frames)
+        res = self.d.model.predict(source=[frames[c] for c in cams], imgsz=self.imgsz, conf=self.conf,
+                                   classes=[self.d.class_id], device=self.d.device, retina_masks=True, verbose=False)
+        dets, polys = {}, {}
+        for c, r in zip(cams, res):
+            fr = self.d._convert(r, c, idx)
+            if fr.detection is not None:
+                dets[c], polys[c] = fr.detection, fr.polygon
+        return dets, polys
+
+
+class ClassicLive:
+    def __init__(self, data: Path, cams: list[int]):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from detection.classic import ClassicSettings, _State
+        from pipeline.detect import camera_rotations
+
+        self.rot = {c: camera_rotations(data, c) for c in cams}
+        self.states = {c: _State(ClassicSettings(), self.rot[c][0] if self.rot[c][1] is not None else None)
+                       for c in cams}
+        self.pool = ThreadPoolExecutor(len(cams))
+        self.name = "без нейросети вживую"
+
+    def detect(self, idx, frames):
+        def run(c):
+            rots = self.rot[c][1]
+            R = rots[min(idx, len(rots) - 1)] if rots is not None else None
+            return c, self.states[c].step(frames[c], c, idx, R)
+        dets, polys = {}, {}
+        for c, fr in self.pool.map(run, list(frames)):
+            if fr.detection is not None:
+                dets[c], polys[c] = fr.detection, fr.polygon
+        return dets, polys
+
+
+class Precomputed:
+    def __init__(self, det_dir: Path, cams: list[int]):
+        import json
+
+        self.table, _ = load_detections_table(det_dir, cams)
+        self.polys = load_polygons(det_dir, cams)
+        try:
+            classic = str(json.loads((det_dir / "meta.json").read_text()).get("detector", "")).startswith("classic")
+        except (OSError, ValueError):
+            classic = False
+        self.name = ("детектор без нейросети" if classic else "YOLO") + ", детекции посчитаны заранее"
+
+    def detect(self, idx, frames):
+        dets = {c: self.table[c][idx] for c in frames if idx in self.table.get(c, {})}
+        return dets, {c: self.polys.get((c, idx)) for c in dets}
+
+
 def project(cam, pts):
     uv = cam.project(np.atleast_2d(pts)) * SCALE
     return uv
@@ -74,7 +242,10 @@ def project(cam, pts):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", type=Path, default=Path("tmp/project2"))
-    p.add_argument("--detections", type=Path, default=Path("outputs/main/detections"))
+    p.add_argument("--live", choices=["yolo", "classic"], default="yolo", help="детектор, работающий вживую")
+    p.add_argument("--detections", type=Path, default=None, help="папка готовых детекций (вместо живой детекции)")
+    p.add_argument("--weights", type=Path, default=Path("models/best.pt"))
+    p.add_argument("--imgsz", type=int, default=640, help="размер входа YOLO вживую (960 точнее, но вдвое медленнее)")
     p.add_argument("--config", default="configs/upgrade_recommended.json", help="JSON конфигурации или none (вариант A)")
     p.add_argument("--speed", type=float, default=1.0, help="темп воспроизведения (1 — реальный)")
     p.add_argument("--save", type=Path, default=None)
@@ -96,15 +267,24 @@ def main(argv=None):
     cams_ids = cfg.cameras.ids
     model = load_truck_model(cfg)
     tracker, _, _, dims = build_components(cfg, model)
-    table, n = load_detections_table(args.detections, cams_ids)
-    polys = load_polygons(args.detections, cams_ids)
+    paths = {c: args.data / cfg.cameras.video_pattern.format(cam=c) for c in cams_ids}
+    n = int(cv2.VideoCapture(str(paths[cams_ids[0]])).get(cv2.CAP_PROP_FRAME_COUNT))
+    if args.detections is not None:
+        detector, source, live = Precomputed(args.detections, cams_ids), FileSource(paths), False
+    else:
+        print("загрузка детектора…", flush=True)
+        detector = YoloLive(args.weights, args.imgsz, cfg.detector.conf) if args.live == "yolo" \
+            else ClassicLive(args.data, cams_ids)
+        warm = {c: cv2.VideoCapture(str(paths[c])).read()[1] for c in cams_ids}
+        if args.live == "yolo":
+            detector.detect(0, warm)                         # прогрев (первый вызов модели долгий)
+        source, live = LiveSource(paths, cfg.cameras.fps), True
+    det_name = detector.name
     try:
         target = load_target(args.data)
     except Exception:                                    # noqa: BLE001
         target = None
-    readers = {c: Reader(args.data / cfg.cameras.video_pattern.format(cam=c)) for c in cams_ids}
-    for r in readers.values():
-        r.start()
+    source.start()
 
     # масштаб — по траектории (эталон только задаёт рамку картинки); камеры за рамкой не рисуются
     if target is not None:
@@ -114,7 +294,7 @@ def main(argv=None):
     lo, hi = pts.min(0), pts.max(0)
     pad = 0.08 * (hi - lo)
     lo, hi = lo - pad, hi + pad
-    MAP = (1920, 360)
+    MAP = (640, 360)
     k = min(MAP[0] / (hi[0] - lo[0]), MAP[1] / (hi[1] - lo[1]))
 
     def to_map(xy):
@@ -122,37 +302,45 @@ def main(argv=None):
         return np.c_[(xy[:, 0] - lo[0]) * k + (MAP[0] - (hi[0] - lo[0]) * k) / 2,
                      MAP[1] - ((xy[:, 1] - lo[1]) * k + (MAP[1] - (hi[1] - lo[1]) * k) / 2)]
 
-    f_big, f_mid, f_small = font(26), font(20), font(16)
+    f_big, f_mid, f_small = font(28), font(21), font(16)
     trail = deque(maxlen=90)
     est_path, gt_path = [], []
     writer = None
     if args.save:
         args.save.parent.mkdir(parents=True, exist_ok=True)
-        writer = cv2.VideoWriter(str(args.save), cv2.VideoWriter_fourcc(*"mp4v"), cfg.cameras.fps, (1920, 1080))
+        writer = cv2.VideoWriter(str(args.save), cv2.VideoWriter_fourcc(*"mp4v"), cfg.cameras.fps, (1920, 960))
     if not args.no_window:
         cv2.namedWindow("Peleng: 5 камер, реальное время", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Peleng: 5 камер, реальное время", 1600, 900)
+        cv2.resizeWindow("Peleng: 5 камер, реальное время", 1440, 720)
     period = 1.0 / (cfg.cameras.fps * args.speed)
     t_next = time.perf_counter()
     fps_hist = deque(maxlen=30)
     paused = False
     m = cfg.detector.edge_margin_px
-    for f in range(n):
-        frames = {c: readers[c].q.get() for c in cams_ids}
-        if any(v is None for v in frames.values()):
+    prev_f = None
+    det_ms = 0.0
+    while True:
+        got = source.next()
+        if got is None:
             break
+        f, full = got
+        frames = {c: cv2.resize(img, TILE, interpolation=cv2.INTER_AREA) for c, img in full.items()}
         cams = {c: make_camera(args.data, c, f + cfg.cameras.frame_offset) for c in cams_ids}
-        dets, tuples = {}, []
+        t_d = time.perf_counter()
+        dets, cur_polys = detector.detect(f, full)
+        det_ms = (time.perf_counter() - t_d) * 1000
+        tuples = []
         for c in cams_ids:
-            d = table[c].get(f)
+            d = dets.get(c)
             if d is None:
                 continue
-            dets[c] = d
             valid = np.array([d.x1 > m, d.x2 < cfg.cameras.width - m, d.y1 > m, d.y2 < cfg.cameras.height - m])
             tuples.append((c, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence, (d.point_u, d.point_v),
-                           not d.unreliable, polys.get((c, f)) if cfg.orientation.enabled else None))
+                           not d.unreliable, cur_polys.get(c) if cfg.orientation.enabled else None))
+        dt_frames = 1.0 if prev_f is None else float(f - prev_f)
+        prev_f = f
         t0 = time.perf_counter()
-        est = tracker.step(f, {c: cams[c] for c, *_ in tuples}, tuples, dt_frames=1.0)
+        est = tracker.step(f, {c: cams[c] for c, *_ in tuples}, tuples, dt_frames=dt_frames)
         tick_ms = (time.perf_counter() - t0) * 1000
         ok = np.all(np.isfinite(est.position))
         gt = target.position(f + cfg.cameras.frame_offset) if target is not None else np.full(3, np.nan)
@@ -163,14 +351,14 @@ def main(argv=None):
             gt_path.append(gt[:2].copy())
         sil = silhouette_points(est.box_center, tracker.heading_dir, model, dims.as_array()) if ok else None
 
-        canvas = np.zeros((1080, 1920, 3), np.uint8)
+        canvas = np.zeros((960, 1920, 3), np.uint8)
         slots = [(0, 0), (640, 0), (1280, 0), (0, 360), (640, 360)]
         for (x0, y0), c in zip(slots, cams_ids):
             img = frames[c].copy()
             cam = cams[c]
             if c in dets:
                 d = dets[c]
-                poly = polys.get((c, f))
+                poly = cur_polys.get(c)
                 if poly is not None:
                     cv2.polylines(img, [(poly * SCALE).astype(np.int32)], True, (90, 220, 90), 1, cv2.LINE_AA)
                 rejected = c in est.rejected_cameras
@@ -201,13 +389,13 @@ def main(argv=None):
             cv2.rectangle(canvas, (x0, y0), (x0 + 639, y0 + 359), (40, 40, 40), 1)
 
         # вид сверху
-        mp = canvas[720:1080]
+        mp = canvas[360:720, 1280:1920]
         mp[:] = (24, 24, 28)
         for c in cams_ids:
             q = to_map(cams[c].position[:2])[0].astype(int)
             fwd = cams[c].forward[:2] / max(np.linalg.norm(cams[c].forward[:2]), 1e-9)
-            cv2.circle(mp, tuple(q), 6, (180, 180, 180), -1)
-            cv2.line(mp, tuple(q), tuple((q + fwd * [1, -1] * 30).astype(int)), (180, 180, 180), 2)
+            cv2.circle(mp, tuple(q), 4, (180, 180, 180), -1)
+            cv2.line(mp, tuple(q), tuple((q + fwd * [1, -1] * 18).astype(int)), (180, 180, 180), 2)
             cv2.putText(mp, str(c), tuple(q + [8, -8]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         if len(gt_path) > 1:
             cv2.polylines(mp, [to_map(np.array(gt_path)).astype(np.int32)], False, (150, 150, 150), 2, cv2.LINE_AA)
@@ -251,37 +439,49 @@ def main(argv=None):
             (f"Неопределённость: 95 % в радиусе ~{ref_r:4.1f} м, курс ±{np.degrees(est.heading_std):4.1f}°" if ok else "",
              f_mid, (120, 220, 120)),
             (f"Ошибка против эталона CSV: {err:5.2f} м" if np.isfinite(err) else "Ошибка: —", f_mid, (255, 220, 120)),
-            (f"Трекер: {tick_ms:4.1f} мс/кадр   показ: {fps:4.1f} FPS", f_mid, (230, 230, 230)),
-            ("Детекции YOLO посчитаны заранее; трекер видит только прошлое", f_small, (170, 170, 170)),
+            (f"Детектор: {det_ms:4.0f} мс   трекер: {tick_ms:4.1f} мс   обновлений: {fps:4.1f} /с", f_mid, (230, 230, 230)),
+            (f"Пропущено кадров (не успели обработать): {source.skipped / max(f + 1, 1) * 100:3.0f} %" if live
+             else "Обрабатывается каждый кадр", f_mid, (230, 230, 230)),
+            (f"Детекции: {det_name}; трекер видит только прошлое", f_small, (170, 170, 170)),
             ("Синий — модель по оценке, жёлтый — точка CSV и след, красный — центр", f_small, (170, 170, 170)),
             ("кабины, белый крест — эталон (только для сравнения), зелёный — маска", f_small, (170, 170, 170)),
         ]
-        for text, fnt, col in lines:
-            dr.text((px, py), text, font=fnt, fill=col)
-            py += fnt.size + 9
-        dr.text((12, 728), "Вид сверху: серая — эталон CSV, жёлтая — оценка, эллипс — 95 % неопределённости",
-                font=f_small, fill=(200, 200, 200))
+        # метрики — внизу на всю ширину, три колонки
+        cols = [lines[0:4], lines[4:8], lines[8:]]
+        for ci, col_lines in enumerate(cols):
+            px, py = 18 + ci * 640, 732
+            for text, fnt, col in col_lines:
+                dr.text((px, py), text, font=fnt, fill=col)
+                py += fnt.size + 12
+        dr.text((1290, 366), "Вид сверху: серая — эталон, жёлтая — оценка, эллипс — 95 %", font=f_small, fill=(200, 200, 200))
         canvas = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
-        if args.start_snapshot is not None and f == args.start_snapshot:
+        if args.start_snapshot is not None and f >= args.start_snapshot:
             cv2.imwrite("outputs/demo_snapshot.png", canvas)
             break
         if writer is not None:
             writer.write(canvas)
         if not args.no_window:
             cv2.imshow("Peleng: 5 камер, реальное время", canvas)
-            t_next += period
-            wait = max(1, int((t_next - time.perf_counter()) * 1000))
-            key = cv2.waitKey(wait) & 0xFF
-            if time.perf_counter() > t_next + 0.5:
-                t_next = time.perf_counter()               # отстали — не догоняем, темп от текущего момента
+            if live:
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                t_next += period
+                wait = max(1, int((t_next - time.perf_counter()) * 1000))
+                key = cv2.waitKey(wait) & 0xFF
+                if time.perf_counter() > t_next + 0.5:
+                    t_next = time.perf_counter()           # отстали — не догоняем, темп от текущего момента
             if key == ord(" "):
                 paused = True
+                if live:
+                    source.clock.pause()
             while paused:
                 key = cv2.waitKey(50) & 0xFF
                 if key in (ord(" "), ord("q"), 27):
                     paused = False
                     t_next = time.perf_counter()
+                    if live:
+                        source.clock.resume()
             if key in (ord("q"), 27):
                 break
     if writer is not None:
