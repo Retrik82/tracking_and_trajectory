@@ -39,6 +39,7 @@ def run_detection(args) -> None:
     try:
         detector = YoloDetector(YoloSettings(
             weights_path=args.weights, imgsz=args.imgsz, conf=args.conf, device=args.device,
+            backend=getattr(args, "backend", "auto"),
             min_mask_area_px=args.min_mask_area, min_reliable_conf=args.min_reliable_conf,
         ))
     except WeightsNotFoundError as e:
@@ -72,7 +73,7 @@ def run_detection(args) -> None:
 
     (out / "meta.json").write_text(json.dumps({
         "weights": str(args.weights), "imgsz": args.imgsz, "conf": args.conf,
-        "device": detector.device, "classes": detector.model.names,
+        "device": detector.device, "backend": detector.backend, "classes": detector.model.names,
     }, ensure_ascii=False, indent=2))
 
 

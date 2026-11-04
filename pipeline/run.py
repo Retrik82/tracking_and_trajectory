@@ -98,6 +98,8 @@ def build_main_parser() -> argparse.ArgumentParser:
     g.add_argument("--imgsz", type=int, default=960)
     g.add_argument("--conf", type=float, default=0.25)
     g.add_argument("--device", default=None, help="mps / cuda / cpu; по умолчанию — автоматически")
+    g.add_argument("--backend", default="auto", choices=["auto", "torch", "onnx", "openvino"],
+                   help="бэкенд инференса (auto: GPU — torch, CPU — из профиля производительности)")
     g.add_argument("--min-mask-area", type=float, default=400.0, help="маска меньше — флаг too_small, px")
     g.add_argument("--min-reliable-conf", type=float, default=0.5)
 

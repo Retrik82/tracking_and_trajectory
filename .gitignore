@@ -36,3 +36,6 @@ tmp/
 outputs/
 *.fbx
 *.pt-*
+
+# Кэш экспорта модели в другие бэкенды (создаётся автоматически из best.pt)
+models/*_openvino_model/

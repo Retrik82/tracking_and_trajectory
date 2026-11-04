@@ -6,3 +6,8 @@ torch==2.15.0
 torchvision==0.29.2
 opencv-python==5.0.0.93
 matplotlib==3.11.2
+psutil==7.2.2
+# Ускорение CPU-инференса (detection/yolo.py, backend onnx/openvino; на GPU не обязательны)
+onnxruntime==1.31.1
+onnx==1.23.2
+openvino==2026.4.1
