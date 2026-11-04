@@ -51,9 +51,22 @@
   частоты, замерено), прогрев до t0, адаптивное окно инициализации и предел коррекции ×dt в
   visibility.py. Итог RT (openvino@480, бюджет 3): 3 тика/с, p50 354 мс, 96/102 MEASURED,
   ошибка 3.02/6.20/7.78 м (офлайн 2.0/6.1/9.0); оценка — `tools/eval_stream_track.py`.
+- Ветка `feature/camera-intrinsics` (4 ноября 2026, от master ed1b95e; не запушена): параметры камер
+  из CSV по именам колонок (позиция, углы, фокус в мм — пара в заголовке или колонка
+  `Focal_Length_mm`), разрешение отдельно по каждому видео (`data_io.probe_video_resolution`,
+  без видео — `image_size` в `detections/meta.json`), матрица 23.76 × 13.365 мм — константа в
+  `reconstruction/camera.py`, пересчёт мм→px только в `pixel_focal_lengths`. Убраны `IMAGE_WIDTH/HEIGHT`,
+  `cameras.width/height/sensor_*` (старые ключи конфигурации: width/height игнорируются, sensor — только
+  равный константе), `TrackerSettings/SchedulerSettings.image_width/height` — размер кадра берётся у камеры.
+  Пересекается с чужой незалитой веткой `origin/feature/scene2-resolution` (там разрешение с первой
+  камеры на все и подстановка 1920×1080 при ошибке) — при слиянии будет конфликт в `data_io.py`.
 
 ## Окружение
 
+- Вторая машина (4 ноября 2026): `C:\Users\ASUS\artemTwoHours\tracking_and_trajectory`, Ryzen 5 3550H
+  (8 потоков), ОЗУ 13.9 ГБ; Python 3.14 поставлен `winget install Python.Python.3.14 --scope user`, `.venv`
+  с numpy/scipy/opencv/pytest/matplotlib по requirements.txt, без torch/ultralytics; весов `models/best.pt`,
+  FBX и ffmpeg нет. Полный pytest ~6–7 мин.
 - С ноября 2026 рабочая машина — Windows 11 (`D:\tracking_and_trajectory`), 6 ядер CPU, без GPU:
   `py -3.14 -m venv .venv`, `.venv\Scripts\python main.py --data D:\project2`, тесты
   `.venv\Scripts\python -m pytest -q` (~100 с; `test_synchronizer_excludes_desynchronized_camera`
@@ -78,6 +91,12 @@
 
 ## Факты о данных (проверены)
 
+- Сцена 2 (папка `data/` в `C:\Users\ASUS\artemTwoHours\tracking_and_trajectory`, в .gitignore): 9 камер
+  `Way2.FinalImage.CineCameraActor{1..9}.mp4`, все 1920×1080, 30 fps, 1932 кадра (метаданные = декодированный
+  кадр); CSV камер — 1933 строки (кадры 0–1932), заголовок `Frame;Loc_X;Loc_Y;Loc_Z;Rot_Roll;Rot_Pitch;Rot_Yaw;
+  Focal_Length_mm`, фокус в каждой строке, постоянный: cam2 60, cam4 50, cam5 25, остальные 35 мм; испорченных
+  строк нет; cam2 движется. `matrix_size.txt` = «23,76 mm * 13,365 mm». CSV цели в сцене 2 НЕТ.
+- Сцена 1 (`D:\project2` на прежней машине):
 - Видео 1001 кадр, CSV 1002 строки; смещение кадров 0 (0 и +1 почти не различимы).
 - CSV цели: испорчены кадр 402 X и кадр 691 Y (даты из Excel) — NaN, не угадывать.
 - Camera5 вращается по yaw на кадрах 565–960, переход ±180° между 623 и 624.

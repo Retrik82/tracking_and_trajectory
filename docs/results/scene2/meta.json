@@ -1,0 +1,20 @@
+{
+  "weights": "models\\best.pt",
+  "imgsz": 480,
+  "conf": 0.25,
+  "device": "cpu",
+  "backend": "torch",
+  "classes": {
+    "0": "truck"
+  },
+  "image_size": {
+    "6": [
+      1920,
+      1080
+    ],
+    "9": [
+      1920,
+      1080
+    ]
+  }
+}
