@@ -20,7 +20,9 @@
    в фон), а пятно, неподвижное целиком, быстро впитывается. Так убирается «призрак» на месте,
    где грузовик стоял в первом кадре. Попиксельно так делать нельзя: середина однотонного кузова
    от кадра к кадру не меняется, впитывалась бы в фон и оставляла след за грузовиком.
-4. Из найденных пятен берётся то, что ближе к прошлой рамке (а без неё — самое большое).
+4. Рамка пятна строится по пикселям, менявшимся за последние кадры (края едущего грузовика),
+   поэтому неподвижный «призрак», слившийся с грузовиком, её не растягивает. Из пятен берётся
+   то, что ближе к прошлой рамке (а без неё — самое большое).
 """
 
 from collections.abc import Iterator
@@ -43,6 +45,8 @@ class ClassicSettings:
     alpha_still: float = 0.15           # скорость впитывания «призрака» (неподвижного пятна)
     still_frames: int = 12              # столько кадров без изменений — передний план неподвижен
     ghost_still_fraction: float = 0.97  # пятно, неподвижное на такой доле пикселей, — «призрак»
+    active_frames: int = 6              # «менялся недавно»: не позже стольких кадров назад
+    min_active_fraction: float = 0.05   # меньше — объект стоит, рамка по всему пятну
     provisional_frames: int = 150       # панорама: участок, увиденный впервые недавно, — фон под вопросом
     close_px: int = 15                  # закрытие маски, пиксели уменьшенного кадра
     group_px: int = 25                  # пятна ближе этого объединяются в один объект
@@ -184,8 +188,22 @@ class _State:
                 continue
             if area < min_area_small:
                 continue
-            ys, xs = np.nonzero(member)
-            candidates.append((member, area, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)))
+            # Рамка — по пикселям, менявшимся за последние кадры. У едущего грузовика меняются оба
+            # края, передний и задний, а однотонная середина кузова лежит между ними и попадает в
+            # рамку сама. «Призрак» позади (место, где грузовик был, когда фон запоминался) давно
+            # не меняется — в рамку не попадает, даже если слился с грузовиком в одно пятно.
+            active = member & (self.still < s.active_frames)
+            if active.sum() >= s.min_active_fraction * area:
+                ys, xs = np.nonzero(active)
+                box = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+                inside = np.zeros_like(member)
+                inside[box[1]:box[3], box[0]:box[2]] = True
+                member = member & inside
+                area = int(member.sum())
+            else:
+                ys, xs = np.nonzero(member)
+                box = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+            candidates.append((member, area, box))
         return candidates, ghosts
 
     def _pick(self, candidates, camera: int, frame: int, w_full: int, h_full: int) -> FrameResult:
