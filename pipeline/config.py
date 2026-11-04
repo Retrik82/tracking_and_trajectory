@@ -86,6 +86,8 @@ class StreamingConfig:
     queue_size: int = 2                        # кадров в очереди на камеру; старые вытесняются
     sync_tolerance_ms: float = 20.0            # кадры разных камер считаются одновременными в этом допуске
     max_frame_age_ms: float = 150.0            # кадр старше — устаревший, пропускается
+    decode_on_demand: bool = True              # вытесняющие очереди: retrieve только нужных кадров
+                                               # (grab на каждом; свежесть ≤ ~100 мс), экономит CPU
     detector_workers: int = 2                  # потоков детекции (при CPU-инференсе больше не помогает)
     max_images_per_tick: int | None = None     # бюджет YOLO-изображений на тик (live/CPU): лишние активные
                                                # камеры обходятся по кругу; None — без ограничения

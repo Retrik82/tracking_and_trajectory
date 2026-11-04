@@ -46,6 +46,11 @@
   (`pipeline/autotune.py`, профиль `configs/performance_profile.json`), бюджет
   `streaming.max_images_per_tick` с якорением стерео-пары, переподключение live-источников,
   Ctrl+C с сохранением результатов, docs/HARDWARE_PROFILE|PERFORMANCE_REPORT|PRODUCTION_ARCHITECTURE|DEPLOYMENT.
+  Вторая итерация: imgsz 480 проверен на качество (вариант A: 2.06/6.07/10.03 — не хуже 960),
+  decode_on_demand (retrieve по выровненным индексам), бюджет 3 лучше 2 и 4 (геометрия против
+  частоты, замерено), прогрев до t0, адаптивное окно инициализации и предел коррекции ×dt в
+  visibility.py. Итог RT (openvino@480, бюджет 3): 3 тика/с, p50 354 мс, 96/102 MEASURED,
+  ошибка 3.02/6.20/7.78 м (офлайн 2.0/6.1/9.0); оценка — `tools/eval_stream_track.py`.
 
 ## Окружение
 

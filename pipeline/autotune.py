@@ -89,9 +89,12 @@ def measure_variants(weights: Path, imgsz_list: list[int], backends: list[str], 
 
 def choose(measured: list[dict], fps: float, min_imgsz: int = 640) -> dict:
     """
-    Самый быстрый вариант с imgsz ≥ min_imgsz. Бюджет изображений на тик — из скорости,
-    но не меньше 2: для инициализации и стерео-измерений фильтру нужны две камеры в одном
-    тике (бюджет 1 оставил бы трекер в INITIALIZING навсегда). Быстрое железо — без бюджета.
+    Самый быстрый вариант с imgsz ≥ min_imgsz. Бюджет изображений на тик:
+      None  быстрое железо (≥ 5·fps изобр./с) — бюджет не нужен;
+      3     ≥ 10 изобр./с: 3 камеры в тике заметно улучшают геометрию против 2
+            (замер на реальных видео: медиана 3.5 м против 4.8 м при близкой частоте тиков);
+      2     иначе — минимум для инициализации и стерео (бюджет 1 оставил бы
+            трекер в INITIALIZING навсегда).
     """
     ok = [r for r in measured if "ms_per_image" in r and r["imgsz"] >= min_imgsz]
     if not ok:
@@ -100,7 +103,12 @@ def choose(measured: list[dict], fps: float, min_imgsz: int = 640) -> dict:
         raise RuntimeError("auto-tune: ни один вариант инференса не работает")
     best = min(ok, key=lambda r: r["ms_per_image"])
     capacity = 1000.0 / best["ms_per_image"]
-    budget = max(2, int(capacity / fps)) if capacity < 5 * fps else None
+    if capacity >= 5 * fps:
+        budget = None
+    elif capacity >= 10.0:
+        budget = 3
+    else:
+        budget = 2
     return {"detector.backend": best["backend"], "detector.imgsz": best["imgsz"],
             "detector.retina_masks": False,
             "streaming.max_images_per_tick": budget,

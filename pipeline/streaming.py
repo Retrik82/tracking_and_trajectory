@@ -128,12 +128,22 @@ class FrameSource:
 
 
 class VideoSource(FrameSource):
-    """Видео (файл — replay с исходным темпом; URL/устройство — live). Общий t0 задаёт синхронный старт."""
+    """
+    Видео (файл — replay с исходным темпом; URL/устройство — live). Общий t0 задаёт синхронный старт.
+
+    decode_on_demand (только вытесняющие очереди): cap.grab() на каждом кадре (декодер обязан идти
+    последовательно), а retrieve (YUV→BGR + копия ~6 МБ) — лишь когда кадр имеет шанс быть
+    использованным: очередь пуста, либо раз в refresh_every кадров (свежесть ≤ ~100 мс). Остальные
+    кадры всё равно были бы вытеснены; экономит заметную долю CPU при пяти потоках 1080p30.
+    """
 
     def __init__(self, camera: int, source, fps: float, t0: float, pacing: bool = True, queue_size: int = 2,
-                 live: bool = False, max_frames: int | None = None):
+                 live: bool = False, max_frames: int | None = None, decode_on_demand: bool = True):
         super().__init__(camera, queue_size, lossless=not pacing and not live)
         self.source, self.fps, self.t0, self.pacing, self.live, self.max_frames = source, fps, t0, pacing, live, max_frames
+        self.decode_on_demand = decode_on_demand and not self.lossless
+        self.refresh_every = max(1, round(fps / 10))      # декодировать не реже ~10 Гц на камеру
+        self.skipped_decode = 0
 
     RECONNECT_DELAY_S = 2.0          # live: пауза перед повторным подключением источника
     RECONNECT_ATTEMPTS = 30          # live: попыток подряд до окончательного отключения камеры
@@ -159,7 +169,7 @@ class VideoSource(FrameSource):
                 delay = due - time.perf_counter()
                 if delay > 0:
                     time.sleep(delay)
-            ok, img = cap.read() if cap.isOpened() else (False, None)
+            ok = cap.grab() if cap.isOpened() else False
             if not ok:
                 if not self.live:
                     break                        # файл закончился
@@ -177,6 +187,20 @@ class VideoSource(FrameSource):
                 cap = cv2.VideoCapture(self.source)
                 continue
             failures = 0
+            # retrieve по выровненным индексам (index % refresh_every == 0): все камеры декодируют
+            # одни и те же кадры, и синхронизатор собирает полные связки; пустая очередь
+            # (потребитель ждёт) тоже форсирует декодирование
+            if self.decode_on_demand and self.queue and index % self.refresh_every != 0:
+                with self._cv:
+                    self.produced += 1
+                    self.dropped += 1
+                self.skipped_decode += 1
+                index += 1
+                continue
+            ok, img = cap.retrieve()
+            if not ok:
+                index += 1
+                continue
             now = time.perf_counter()
             ts = (now - self.t0) if self.live else index / self.fps
             self.push(Frame(self.camera, index, ts, img, now))
@@ -637,13 +661,15 @@ class StreamPipeline:
                     log.warning("cam%d: нет видео %s — камера пропущена", cam, path)
                     continue
                 self.sources[cam] = VideoSource(cam, str(path), c.fps, t0, s.realtime_pacing, s.queue_size,
-                                                live=False, max_frames=s.max_frames)
+                                                live=False, max_frames=s.max_frames,
+                                                decode_on_demand=s.decode_on_demand)
             elif s.mode == "live":
                 src = c.live_sources.get(str(cam)) or c.live_sources.get(cam)
                 if src is None:
                     log.warning("cam%d: нет источника в cameras.live_sources — камера пропущена", cam)
                     continue
-                self.sources[cam] = VideoSource(cam, src, c.fps, t0, False, s.queue_size, live=True)
+                self.sources[cam] = VideoSource(cam, src, c.fps, t0, False, s.queue_size, live=True,
+                                                decode_on_demand=s.decode_on_demand)
             else:
                 raise ValueError(f"неизвестный режим {s.mode}")
         for src in self.sources.values():
@@ -807,6 +833,7 @@ class StreamPipeline:
                            "p95": float(np.nanpercentile(lat, 95)), "max": float(np.nanmax(lat))},
             "mean_active_cameras": float(active.mean()),
             "dropped_frames": drops, "produced_frames": produced,
+            "skipped_decode_frames": {cam: getattr(src, "skipped_decode", 0) for cam, src in self.sources.items()},
             "dropped_fraction": sum(drops.values()) / max(sum(produced.values()), 1),
             "sync_excluded_frames": getattr(self, "sync_excluded", 0),
             "stages": self.timer.summary(),

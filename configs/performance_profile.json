@@ -1,5 +1,5 @@
 {
-  "created": "2026-11-04 17:10:58",
+  "created": "2026-11-04 17:57:38",
   "hardware": {
     "platform": "Windows",
     "cpu_model": "AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD",
@@ -11,55 +11,55 @@
     {
       "backend": "torch",
       "imgsz": 480,
-      "ms_per_image": 100.3
+      "ms_per_image": 104.7
     },
     {
       "backend": "torch",
       "imgsz": 640,
-      "ms_per_image": 150.9
+      "ms_per_image": 244.9
     },
     {
       "backend": "torch",
       "imgsz": 960,
-      "ms_per_image": 357.8
+      "ms_per_image": 277.0
     },
     {
       "backend": "onnx",
       "imgsz": 480,
-      "ms_per_image": 62.2
+      "ms_per_image": 127.3
     },
     {
       "backend": "onnx",
       "imgsz": 640,
-      "ms_per_image": 164.2
+      "ms_per_image": 147.2
     },
     {
       "backend": "onnx",
       "imgsz": 960,
-      "ms_per_image": 284.7
+      "ms_per_image": 245.0
     },
     {
       "backend": "openvino",
       "imgsz": 480,
-      "ms_per_image": 67.2
+      "ms_per_image": 55.8
     },
     {
       "backend": "openvino",
       "imgsz": 640,
-      "ms_per_image": 108.4
+      "ms_per_image": 137.6
     },
     {
       "backend": "openvino",
       "imgsz": 960,
-      "ms_per_image": 233.3
+      "ms_per_image": 284.4
     }
   ],
   "chosen": {
     "detector.backend": "openvino",
-    "detector.imgsz": 640,
+    "detector.imgsz": 480,
     "detector.retina_masks": false,
-    "streaming.max_images_per_tick": 2,
-    "_expected_ms_per_image": 108.4,
-    "_expected_images_per_s": 9.2
+    "streaming.max_images_per_tick": 3,
+    "_expected_ms_per_image": 55.8,
+    "_expected_images_per_s": 17.9
   }
 }

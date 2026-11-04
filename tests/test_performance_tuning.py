@@ -45,8 +45,14 @@ def test_choose_respects_min_imgsz_and_budget_floor():
     chosen = choose(measured, fps=30.0, min_imgsz=640)
     assert chosen["detector.backend"] == "openvino"
     assert chosen["detector.imgsz"] == 640            # 480 быстрее, но ниже порога качества
-    # 1000/110 ≈ 9 изобр./с < 30 FPS → бюджет минимум 2 (две камеры для стерео)
+    # 1000/110 ≈ 9 изобр./с < 10 → бюджет 2 (минимум для стерео)
     assert chosen["streaming.max_images_per_tick"] == 2
+
+
+def test_choose_budget_three_when_capacity_allows():
+    measured = [{"backend": "onnx", "imgsz": 480, "ms_per_image": 61.0}]   # ≈16 изобр./с
+    chosen = choose(measured, fps=30.0, min_imgsz=480)
+    assert chosen["streaming.max_images_per_tick"] == 3
 
 
 def test_choose_fast_hardware_no_budget():
