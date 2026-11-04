@@ -38,7 +38,14 @@
   сессии недоступны (сеть закрыта для drive.google.com, нет GPU/torch) — всё прогонялось на синтетике.
   4 ноября 2026 (локальная Windows-сессия): ветка перенесена через bundle, прогнаны `main.py`,
   `stream.py variants/detections/replay` на реальных данных, README и FINAL_REPORT (раздел 11) обновлены
-  реальными числами, результаты в `docs/results/real/`; запушено в ту же ветку.
+  реальными числами, результаты в `docs/results/real/`; запушено в ту же ветку. Позже в master влиты
+  PR #3/#4 (feature/classic-detector — детектор без нейросети, feature/smooth-tracker) и коммит
+  пользователя «latest» (tools/demo_live.py). Ветка `feature/perf-production` (4 ноября 2026,
+  вечер): производительность — бэкенды детектора torch/onnx/openvino с автоэкспортом
+  (`detection/yolo.py`), `tools/benchmark_hardware.py`, автонастройка `--auto-tune`/`--auto-config`
+  (`pipeline/autotune.py`, профиль `configs/performance_profile.json`), бюджет
+  `streaming.max_images_per_tick` с якорением стерео-пары, переподключение live-источников,
+  Ctrl+C с сохранением результатов, docs/HARDWARE_PROFILE|PERFORMANCE_REPORT|PRODUCTION_ARCHITECTURE|DEPLOYMENT.
 
 ## Окружение
 
@@ -51,8 +58,11 @@
   `best.pt-3`, скопирован в `best.pt`), `models/CargoTruck.fbx` — в git не попадают; если их нет,
   сразу спрашивай пользователя, на диске их искать бесполезно. Результаты: `outputs/main/`,
   `outputs/main/variants/`, `outputs/stream*/`.
-- YOLO на CPU: 0.25 с на кадр (960 px), детекция пяти видео ≈ 20 мин. `stream.py replay` в реальном
-  темпе на CPU вытесняет ~99 % кадров — с YOLO на CPU только `--no-pacing`.
+- YOLO на CPU: torch@960 ≈ 0.25–0.28 с/кадр. Железо: Ryzen 5 4500U (6C/6T, AVX2), CUDA нет, iGPU
+  Vega 512 МБ непригодна, ОЗУ 7.4 ГБ (свободно < 1 ГБ — не запускать два YOLO-прогона разом).
+  Быстрее всего OpenVINO: @640 ≈ 0.11–0.14 с, @480 ≈ 0.065 с (`docs/HARDWARE_PROFILE.md`);
+  экспорт кэшируется в `models/best.onnx` / `models/best_openvino_model/` (в .gitignore).
+  Калибровка: `stream.py replay --data D:\project2 --auto-tune`; запуск по профилю: `--auto-config`.
 - Подводные камни: zsh не делит `$var` на слова (используй `${=var}`); ultralytics принимает только
   расширение `.pt`; CSV в CP1251; Blender/assimp нет — FBX читает `reconstruction/fbx_reader.py`;
   в PowerShell 5.1 `2>&1` у python даёт NativeCommandError-шум, ставь `$env:PYTHONUTF8=1` для логов.
