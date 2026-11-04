@@ -146,6 +146,13 @@ class YoloDetector:
         self.model = YOLO(str(model_path), task="segment")
         names = self.model.names
         matches = [i for i, n in names.items() if n == settings.target_class]
+        if not matches and len(names) == 1:
+            # однаклассовая модель с другим именем класса (в разметке best.pt-4 — «track»): это и есть цель
+            import logging
+
+            logging.getLogger("peleng").warning("в модели нет класса %r — единственный класс %r принят за цель",
+                                                settings.target_class, next(iter(names.values())))
+            matches = list(names)
         if not matches:
             raise ValueError(f"В модели нет класса {settings.target_class!r}, есть: {names}")
         self.class_id = matches[0]
