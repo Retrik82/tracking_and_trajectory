@@ -354,3 +354,17 @@ def test_diverged_track_reinitializes_from_stereo():
     err = np.array(err)
     assert err[61] > 3000                                   # сразу после сбоя трек далеко
     assert np.nanmedian(err[100:]) < 100                    # после переинициализации — снова точен
+
+
+def test_camera_seen_on_every_tick_is_not_reappearing_when_ticks_skip_frames():
+    """Тики через 3 кадра (реальный темп): камера, видимая на каждом тике, не «появляется» заново."""
+    data, points = synthetic()
+    tracker = CabTracker(TrackerSettings(), DIMS)
+    by_frame = {}
+    for i, t in enumerate(data.times.astype(int)):
+        by_frame.setdefault(t, []).append(i)
+    for f in range(0, 60, 3):
+        dets = [(int(data.camera_indices[i]), data.edges[i], data.edge_valid[i], 1.0,
+                 points.get((int(data.camera_indices[i]), f)), True) for i in by_frame[f]]
+        tracker.step(f, {d[0]: provider(d[0], f) for d in dets}, dets, dt_frames=3.0)
+    assert all(v == 0 for v in tracker._appeared.values())

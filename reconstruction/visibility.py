@@ -946,8 +946,12 @@ class CabTracker:
         Детекция — кортеж (камера, рамка, рёбра в кадре, уверенность, центроид, надёжна[, контур маски]).
         """
         s = self.s
+        # «снова увидела» — камеры не было на ПРЕДЫДУЩЕМ ТИКЕ (а не на кадре t − 1): в реальном темпе тики
+        # идут через несколько кадров, и иначе каждая камера каждый тик считалась бы только что появившейся
+        # (пониженный вес и проверка передачи на всех детекциях)
+        prev_tick = self._last_frame if self._last_frame is not None else frame - 1
         for d in detections:
-            if self._last_seen.get(d[0], -10 ** 9) < frame - 1:
+            if self._last_seen.get(d[0], -10 ** 9) < prev_tick:
                 self._appeared[d[0]] = frame
             self._last_seen[d[0]] = frame
         if dt_frames is None:
