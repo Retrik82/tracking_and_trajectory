@@ -200,3 +200,19 @@ def test_limits_clip_velocity_change():
     lat_max = s.max_lateral_mps2 * s.accel_to_units
     assert out[3] == pytest.approx(50.0 + long_max)
     assert out[4] == pytest.approx(lat_max)
+
+
+def test_occlusion_decision_is_held_and_released_gradually():
+    """Дребезг «закрыто/открыто» не должен менять набор измерений каждый кадр."""
+    from reconstruction.visibility import CabTracker, TrackerSettings
+
+    tracker = CabTracker(TrackerSettings(occlusion_hold_frames=3, occlusion_ramp_frames=4))
+    det = [(1, None, None, 1.0, None, True)]
+    flags = [True, False, True, False, False, False, False, False, False, False, False]
+    weights = []
+    for frame, flag in enumerate(flags):
+        occluded = np.array([[flag, False, False, False]])
+        weights.append(tracker._occlusion_hysteresis(frame, det, occluded)[0, 0])
+    assert weights[:6] == [0.0] * 6                      # держится закрытым, несмотря на дребезг
+    assert 0 < weights[6] < weights[7] < 1               # возвращается постепенно
+    assert weights[-1] == 1.0

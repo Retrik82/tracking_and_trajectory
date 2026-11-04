@@ -21,7 +21,8 @@
 
 Обработка потери видимости:
 1. Закрытые рёбра: прогнозная рамка (до обновления) сравнивается с рамкой детектора;
-   ребро, ушедшее внутрь при совпадающем противоположном, исключается.
+   ребро, ушедшее внутрь при совпадающем противоположном, исключается. Решение удерживается
+   несколько кадров и снимается плавно (иначе дребезг и зигзаг оценки).
 2. Камера, которая снова увидела грузовик, первые кадры входит с пониженным весом
    (известно из прошлого: сколько кадров назад она его увидела).
 3. Нет наблюдений — прогноз по вектору скорости, неопределённость растёт, точка не пропадает.
@@ -76,6 +77,14 @@ class TrackerSettings:
     occlusion_rel: float = 0.12               # …и больше чем на долю размера рамки
     agree_px: float = 15.0                    # противоположное ребро совпадает с прогнозом
     reappear_ramp_frames: int = 10            # кадров пониженного веса после появления на камере
+    # Гистерезис закрытых рёбер. Решение «ребро закрыто» на соседних кадрах дребезжало
+    # (3-2-3-2 закрытых ребра на кадрах 417–429, 104 смены за видео), набор измерений менялся
+    # каждый кадр, и оценка шла зигзагом. Ребро, признанное закрытым, держится закрытым
+    # occlusion_hold_frames кадров после последнего срабатывания, затем возвращается с весом,
+    # растущим occlusion_ramp_frames кадров. На YOLO: точка CSV 2.20/7.14 → 1.95/6.19 м,
+    # ускорение по траектории p95 91 → 51 м/с². 0 — выключено.
+    occlusion_hold_frames: int = 3
+    occlusion_ramp_frames: int = 8
     reappear_min_weight: float = 0.2
     image_width: int = 1920
     image_height: int = 1080
@@ -189,6 +198,7 @@ class CabTracker:
         self._last_seen: dict[int, int] = {}
         self._appeared: dict[int, int] = {}
         self._last_measured: int | None = None
+        self._occluded_at: dict[tuple[int, int], int] = {}     # (камера, ребро) -> последнее «закрыто»
 
     def _direction(self, state: np.ndarray) -> np.ndarray:
         """Направление «вперёд» — по скорости; при малой скорости — последнее надёжное."""
@@ -269,6 +279,27 @@ class CabTracker:
             out[:3] = prior[:3] + shift * s.max_correction_per_frame / norm
         return out
 
+    def _occlusion_hysteresis(self, frame: int, detections, occluded: np.ndarray) -> np.ndarray:
+        """Вес рёбер (M, 4): 0 — закрыто (с удержанием решения), затем плавный возврат к 1."""
+        s = self.s
+        weight = (~occluded).astype(float)
+        if s.occlusion_hold_frames <= 0:
+            return weight
+        for i, d in enumerate(detections):
+            for k in range(4):
+                key = (d[0], k)
+                if occluded[i, k]:
+                    self._occluded_at[key] = frame
+                last = self._occluded_at.get(key)
+                if last is None:
+                    continue
+                age = frame - last - s.occlusion_hold_frames
+                if age >= s.occlusion_ramp_frames:
+                    del self._occluded_at[key]
+                else:
+                    weight[i, k] = max(0.0, age / s.occlusion_ramp_frames)
+        return weight
+
     def step(self, frame: int, cameras: dict[int, Camera], detections) -> FrameEstimate:
         s = self.s
         for d in detections:
@@ -297,8 +328,9 @@ class CabTracker:
             direction = self._direction(prior)
             predicted = self._measure(prior[:3], direction, geometry)
             occluded = detect_occluded_edges(predicted, observed, valid, s)
-            usable = valid & ~occluded & np.isfinite(predicted)
-            occluded_count = int(occluded.sum())
+            edge_weight = self._occlusion_hysteresis(frame, detections, occluded)
+            usable = valid & np.isfinite(predicted) & (edge_weight > 0)
+            occluded_count = int((valid & (edge_weight == 0)).sum())
             used_cameras = int((usable.sum(axis=1) >= 3).sum())
 
             if usable.any():
@@ -309,7 +341,8 @@ class CabTracker:
                     for d in detections])
                 mask = usable.ravel()
                 observed_flat = observed.ravel()[mask]
-                R0 = np.repeat(s.edge_sigma_px / np.sqrt(conf * ramp), 4)[mask] ** 2
+                R0 = (np.repeat(s.edge_sigma_px / np.sqrt(conf * ramp), 4) ** 2
+                      / np.maximum(edge_weight.ravel(), 1e-6))[mask]
                 P_inv = np.linalg.inv(P_prior)
                 measure = lambda x: self._measure(x[:3], direction, geometry).ravel()[mask]  # noqa: E731
                 state = prior.copy()
