@@ -129,6 +129,13 @@ class TrackerSettings:
                                               # на синтетике с ложными рамками ослабление давало рывки до 60 м)
     min_heading_speed_mps: float = 1.0        # медленнее — курс держится
     heading_rate_limit_dps: float = 60.0      # предел скорости поворота курса, °/с
+    # Кинематика Аккермана (модель «велосипеда») для курса в фильтре: ω = v·tan δ / L, |δ| ≤ δmax, |δ̇| ≤ δ̇max —
+    # курс поворачивает только как настоящая машина (руль не перекладывается мгновенно). База L и углы руля
+    # в данных не заданы — допущение: L ≈ 0.6 длины модели, δmax 35°, δ̇max 30°/с. 0 — выключено (прежний предел).
+    ackermann_wheelbase_m: float = 0.0
+    ackermann_max_steer_deg: float = 35.0
+    ackermann_steer_rate_dps: float = 30.0
+    ackermann_horizon_s: float = 0.5          # руль выбирается так, чтобы снять ошибку курса за это время
     min_turn_radius_m: float = 8.0            # курс не быстрее v / R_min (Аккерман): при 3 м/с ≤ 21°/с, при 1 м/с ≤ 7°/с
     heading_velocity_smoothing: float = 0.5   # цель курса — направление сглаженной скорости (EMA с этим весом)
 
@@ -416,6 +423,7 @@ class CabTracker:
         self._bias_updated = False
         self._sf = SilhouetteFitSettings()
         self._out_heading: float | None = None              # курс прошлого кадра (для предела поворота)
+        self._steer = 0.0                                   # угол руля (модель Аккермана), рад
         self._out_yaw_rate = 0.0                            # скорость поворота итогового курса, рад/кадр
         self._verified: set[int] = set()                    # камеры, чья детекция после появления согласовалась с треком
         self._yaw_rate = 0.0                                # рад/с, сглаженная
@@ -469,12 +477,15 @@ class CabTracker:
             target = float(np.arctan2(self._v_smooth[1], self._v_smooth[0]))
             if self.s.visual_heading and self.s.visual_heading_mode == "bias":
                 target = float(_wrap(target + self._visual_bias))
-            # физический предел: ω ≤ v / R_min — при малой скорости курс почти не меняется,
-            # и шум направления медленной скорости не раскачивает ориентацию
-            rate = min(np.radians(self.s.heading_rate_limit_dps), speed / max(self.s.min_turn_radius_m, 0.1))
-            limit = rate / self.s.fps * max(dt, 1e-6)
             delta = _wrap(target - self.heading)
-            self.heading = _wrap(self.heading + float(np.clip(delta, -limit, limit)))
+            if self.s.ackermann_wheelbase_m > 0:
+                self.heading = _wrap(self.heading + self._ackermann_step(delta, speed, dt))
+            else:
+                # физический предел: ω ≤ v / R_min — при малой скорости курс почти не меняется,
+                # и шум направления медленной скорости не раскачивает ориентацию
+                rate = min(np.radians(self.s.heading_rate_limit_dps), speed / max(self.s.min_turn_radius_m, 0.1))
+                limit = rate / self.s.fps * max(dt, 1e-6)
+                self.heading = _wrap(self.heading + float(np.clip(delta, -limit, limit)))
             horizontal = np.hypot(v[0], v[1])
             slope = v[2] / max(horizontal, 1e-9)
         else:
@@ -486,6 +497,22 @@ class CabTracker:
             self._visual_bias *= self.s.visual_bias_decay ** max(dt, 0.0)
         self._bias_updated = False
         return self.heading_dir
+
+    def _ackermann_step(self, delta: float, speed: float, dt: float) -> float:
+        """
+        Поворот курса за шаг по модели велосипеда: желаемая кривизна снимает ошибку курса delta за
+        ackermann_horizon_s, руль δ = atan(L·κ) ограничен δmax и скоростью перекладки δ̇max; ω = v·tan δ / L.
+        """
+        s = self.s
+        t = max(dt, 1e-6) / s.fps                                   # шаг, с
+        L = s.ackermann_wheelbase_m
+        kappa = delta / max(speed * max(s.ackermann_horizon_s, t), 1e-6)
+        max_steer = np.radians(s.ackermann_max_steer_deg)
+        steer = float(np.clip(np.arctan(L * kappa), -max_steer, max_steer))
+        step = np.radians(s.ackermann_steer_rate_dps) * t
+        self._steer = float(np.clip(steer, self._steer - step, self._steer + step))
+        turn = speed * np.tan(self._steer) / L * t
+        return float(np.clip(turn, -abs(delta), abs(delta))) if np.sign(turn) == np.sign(delta) else float(turn)
 
     def _update_heading_variance(self, state: np.ndarray, dt: float, speed: float) -> None:
         """

@@ -614,6 +614,8 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
         use_edges=t.use_edges, edge_sigma_px=t.edge_sigma_px, huber_k=t.huber_k,
         occlusion_hold_frames=t.occlusion_hold_frames, occlusion_ramp_frames=t.occlusion_ramp_frames,
         occlusion_size_ratio=t.occlusion_size_ratio,
+        ackermann_wheelbase_m=t.ackermann_wheelbase_m, ackermann_max_steer_deg=t.ackermann_max_steer_deg,
+        ackermann_steer_rate_dps=t.ackermann_steer_rate_dps,
         heading_output_rate_limit=t.heading_output_rate_limit, min_turn_radius_m=t.min_turn_radius_m,
         heading_accel_limit_dps2=t.heading_accel_limit_dps2,
         max_longitudinal_mps2=t.max_longitudinal_mps2, max_lateral_mps2=t.max_lateral_mps2,

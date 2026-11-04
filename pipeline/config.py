@@ -192,6 +192,9 @@ class TrackerConfig:
     use_edges: bool = True                     # измерение по рёбрам рамки проекции модели
     heading_output_rate_limit: bool = False    # физический предел поворота для итогового курса (v / R_min)
     min_turn_radius_m: float = 8.0
+    ackermann_wheelbase_m: float = 0.0         # курс по модели Аккермана: база, м (0 — выкл., прежний предел)
+    ackermann_max_steer_deg: float = 35.0      # предельный угол руля
+    ackermann_steer_rate_dps: float = 30.0     # скорость перекладки руля, °/с
     heading_accel_limit_dps2: float = 0.0      # предел углового ускорения итогового курса, °/с² (0 — выкл.)
     occlusion_size_ratio: float = 0.0          # рамка уже проекции модели в столько раз — край срезан (0 — выкл.)
     occlusion_hold_frames: int = 3             # гистерезис закрытых рёбер: удержание решения, кадров (0 — выкл.)
