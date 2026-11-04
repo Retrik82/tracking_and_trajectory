@@ -83,7 +83,8 @@ class CamerasConfig:
 class StreamingConfig:
     mode: str = "replay"                       # live | replay (видео в реальном темпе) | detections (готовые детекции)
     realtime_pacing: bool = True               # replay: выдавать кадры с исходной частотой (иначе — как можно быстрее)
-    queue_size: int = 2                        # кадров в очереди на камеру; старые вытесняются
+    queue_size: int = 8                        # кадров в очереди на камеру; старые вытесняются (запас для
+                                               # выбора кадров одной метки у всех камер, см. Synchronizer)
     sync_tolerance_ms: float = 20.0            # кадры разных камер считаются одновременными в этом допуске
     max_frame_age_ms: float = 150.0            # кадр старше — устаревший, пропускается
     detector_workers: int = 2                  # потоков детекции (при CPU-инференсе больше не помогает)

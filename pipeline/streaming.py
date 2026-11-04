@@ -112,6 +112,33 @@ class FrameSource:
         with self._cv:
             return self.queue[-1] if self.queue else None
 
+    def pop_at(self, t: float, tol: float, max_age_s: float | None = None) -> Frame | None:
+        """
+        Кадр с меткой, ближайшей к t (в пределах tol); он и более старые кадры удаляются, более новые
+        остаются для следующих тиков. Устаревшие по max_age отбрасываются. None — подходящего кадра нет.
+        """
+        with self._cv:
+            now = time.perf_counter()
+            while self.queue and max_age_s is not None and self.queue[0].image is not None \
+                    and now - self.queue[0].captured_at > max_age_s:
+                self.queue.popleft()
+                self.dropped += 1
+            if not self.queue:
+                return None
+            best = min(range(len(self.queue)), key=lambda i: abs(self.queue[i].timestamp - t))
+            if abs(self.queue[best].timestamp - t) > tol:
+                # всё, что старше окна допуска, уже не понадобится
+                while self.queue and self.queue[0].timestamp < t - tol:
+                    self.queue.popleft()
+                    self.dropped += 1
+                return None
+            for _ in range(best):
+                self.queue.popleft()
+                self.dropped += 1
+            f = self.queue.popleft()
+            self._cv.notify_all()
+            return f
+
     def wait(self, timeout: float) -> bool:
         with self._cv:
             if self.queue or self.done:
@@ -250,6 +277,59 @@ class Synchronizer:
                 and time.perf_counter() - frame.captured_at > self.max_age)
 
     def next_bundle(self) -> Bundle | None:
+        if any(not s.lossless for s in self.sources.values()):
+            return self._next_bundle_aligned()
+        return self._next_bundle_ordered()
+
+    def _next_bundle_aligned(self) -> Bundle | None:
+        """
+        Поток в реальном темпе: у каждой камеры в очереди несколько последних кадров. Опорная метка —
+        самая ранняя из «самых новых» меток камер (самая отстающая камера), и у КАЖДОЙ камеры берётся
+        кадр с ближайшей к ней меткой. Раньше брался самый новый кадр каждой камеры: за время тика камеры
+        уходили вперёд на разное число кадров (±1 кадр = 33 мс > допуска 20 мс), и до половины камер
+        выпадало как «рассинхронизация» — трекеру доставалось ~1 камера на тик вместо ~2.3.
+        """
+        deadline = time.perf_counter() + self.wait_s
+        while True:
+            newest = {c: f for c, s in self.sources.items() if (f := s.peek()) is not None}
+            if newest:
+                break
+            if all(s.done for s in self.sources.values()):
+                return None
+            for s in self.sources.values():
+                if not s.done:
+                    s.wait(0.01)
+            if time.perf_counter() > deadline:
+                return None
+        # дать отстающим камерам кадр текущего момента
+        wait_until = time.perf_counter() + min(self.wait_s, 2.0 / self.fps)
+        while time.perf_counter() < wait_until:
+            missing = [c for c, s in self.sources.items() if c not in newest and not s.done]
+            if not missing:
+                break
+            self.sources[missing[0]].wait(0.002)
+            newest = {c: f for c, s in self.sources.items() if (f := s.peek()) is not None}
+        t_ref = min(f.timestamp for f in newest.values())
+        if self.last_index >= 0:
+            t_ref = max(t_ref, (self.last_index + 1) / self.fps - self.tol)
+        frames, excluded = {}, {}
+        for cam, src in self.sources.items():
+            f = src.pop_at(t_ref, self.tol, self.max_age)
+            if f is not None:
+                frames[cam] = f
+            elif cam in newest:
+                excluded[cam] = f"нет кадра в допуске {self.tol * 1000:.0f} мс"
+        self.excluded_total += len(excluded)
+        if not frames:
+            return self._next_bundle_aligned()
+        t_ref = min(f.timestamp for f in frames.values())
+        index = int(round(t_ref * self.fps))
+        if index <= self.last_index:
+            index = self.last_index + 1
+        self.last_index = index
+        return Bundle(index, t_ref, frames, excluded)
+
+    def _next_bundle_ordered(self) -> Bundle | None:
         # подтянуть новые кадры
         deadline = time.perf_counter() + self.wait_s
         while True:

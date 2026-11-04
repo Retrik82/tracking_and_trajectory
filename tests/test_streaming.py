@@ -224,3 +224,19 @@ def test_load_detections_table(tmp_path):
             w.writerows(d.to_row() for d in rows.values())
     loaded, n = load_detections_table(tmp_path, list(table))
     assert n == NUM and loaded[0][5].x1 == table[0][5].x1
+
+
+def test_aligned_synchronizer_takes_same_timestamp_from_all_cameras():
+    """Реальный темп: камеры ушли вперёд на разное число кадров — берётся общий момент, камеры не теряются
+    (раньше брался самый новый кадр каждой камеры: ±1 кадр = 33 мс > допуска, половина камер выпадала)."""
+    a, b = FrameSource(1, queue_size=8), FrameSource(2, queue_size=8)
+    img = np.zeros((2, 2, 3), np.uint8)
+    for i in range(2, 6):
+        a.push(Frame(1, i, i / FPS, img, time.perf_counter()))
+    for i in range(2, 5):                        # камера 2 отстаёт на кадр
+        b.push(Frame(2, i, i / FPS, img, time.perf_counter()))
+    sync = Synchronizer({1: a, 2: b}, FPS, tolerance_s=0.02, max_age_s=1.0, wait_s=0.05)
+    bundle = sync.next_bundle()
+    assert set(bundle.frames) == {1, 2} and not bundle.excluded
+    assert {f.index for f in bundle.frames.values()} == {4}
+    assert a.peek().index == 5                   # более новый кадр остался для следующего тика
