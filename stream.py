@@ -8,6 +8,7 @@
     python stream.py variants   --data tmp/project2 --detections outputs/main/detections
                                                                    # сравнение архитектур A–E на одних детекциях
     python stream.py scenarios                                     # обязательные сценарии ТЗ на синтетике
+    python stream.py upgrade-scenarios --variants A,REC            # сценарии доработки (docs/UPGRADE_REPORT.md)
     python stream.py plots      --track outputs/stream/stream_track.csv --data tmp/project2
     python stream.py config                                        # напечатать конфигурацию по умолчанию (JSON)
 
@@ -39,6 +40,10 @@ def main(argv=None) -> None:
         from tools.run_scenarios import main as scenarios_main
 
         scenarios_main(rest)
+    elif cmd == "upgrade-scenarios":
+        from pipeline.scenarios import main as upgrade_main
+
+        upgrade_main(rest)
     elif cmd == "plots":
         from pipeline.stream_plots import main as plots_main
 
