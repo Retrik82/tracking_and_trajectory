@@ -263,6 +263,18 @@ class UncertaintyConfig:
 
 
 @dataclass
+class SilhouetteConfig:
+    enabled: bool = False                      # подгонка модели к контуру масок ≥2 камер (silhouette_fit.py)
+    mode: str = "measure"                      # measure | heading | output (см. reconstruction/visibility.py)
+    min_views: int = 2
+    area_ratio_min: float = 0.7                # маска частично закрыта, если площадь не согласуется с моделью
+    prior_sigma_m: float = 0.5
+    prior_sigma_heading_deg: float = 5.0
+    inflation: float = 2.0
+    gate_chi2: float = 13.8
+
+
+@dataclass
 class StreamConfig:
     cameras: CamerasConfig = field(default_factory=CamerasConfig)
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -278,6 +290,7 @@ class StreamConfig:
     mono_depth: MonoDepthConfig = field(default_factory=MonoDepthConfig)
     confirmation: ConfirmationConfig = field(default_factory=ConfirmationConfig)
     uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
+    silhouette: SilhouetteConfig = field(default_factory=SilhouetteConfig)
 
     @classmethod
     def load(cls, path: Path | str | None = None, overrides: list[str] | None = None) -> "StreamConfig":

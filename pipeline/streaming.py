@@ -572,6 +572,8 @@ def upgrade_settings(cfg: StreamConfig) -> dict:
         heading_sigma_floor_deg=u.heading_sigma_floor_deg, heading_turn_lag_s=u.heading_turn_lag_s,
         model_length_sigma=u.model_length_sigma_m * upm,
         mono_depth_shape_tol=m.shape_tol,
+        silhouette_fit=cfg.silhouette.enabled, silhouette_gate_chi2=cfg.silhouette.gate_chi2,
+        silhouette_mode=cfg.silhouette.mode,
     )
 
 
@@ -600,6 +602,9 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
                             covariance_inflation=cfg.triangulation.covariance_inflation,
                             units_per_meter=c.units_per_meter)
     tracker = CabTracker(tracker_settings, dims, model, fusion if cfg.triangulation.mode != "none" else None)
+    sf, sc_ = tracker._sf, cfg.silhouette
+    sf.min_views, sf.area_ratio_min, sf.inflation = sc_.min_views, sc_.area_ratio_min, sc_.inflation
+    sf.prior_sigma, sf.prior_sigma_heading_deg = sc_.prior_sigma_m * c.units_per_meter, sc_.prior_sigma_heading_deg
     o = cfg.orientation
     os_ = tracker.orientation_settings
     os_.step_deg, os_.min_iou = o.step_deg, o.min_iou
@@ -764,7 +769,7 @@ class StreamPipeline:
             if d is None:
                 continue
             valid = np.array([d.x1 > m, d.x2 < c.width - m, d.y1 > m, d.y2 < c.height - m])
-            poly = getattr(self.detector, "polygons", {}).get((cam, d.frame)) if cfg.orientation.enabled else None
+            poly = getattr(self.detector, "polygons", {}).get((cam, d.frame)) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None
             tuples.append((cam, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence,
                            (d.point_u, d.point_v), not d.unreliable, poly))
             cameras[cam] = cams_pose[cam]
@@ -1155,12 +1160,12 @@ def main(argv=None) -> None:
     if cfg.streaming.mode == "detections":
         det_dir = args.detections or (Path(cfg.output.out_dir) / "detections")
         detections, num = load_detections_table(det_dir, cfg.cameras.ids)
-        polygons = load_polygons(det_dir, cfg.cameras.ids) if cfg.orientation.enabled else None
+        polygons = load_polygons(det_dir, cfg.cameras.ids) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None
         num = args.num_frames or num
     elif args.detections is not None:
         table, _ = load_detections_table(args.detections, cfg.cameras.ids)
         detector = PrecomputedDetector(table, polygons=load_polygons(args.detections, cfg.cameras.ids)
-                                       if cfg.orientation.enabled else None)
+                                       if (cfg.orientation.enabled or cfg.silhouette.enabled) else None)
         log.warning("replay/live с готовыми детекциями из %s: YOLO не запускается, время детекции не измеряется",
                     args.detections)
     visualizer = None

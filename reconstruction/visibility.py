@@ -58,6 +58,7 @@ from reconstruction.fusion import (
 from reconstruction.ground import OnlineRoadModel, RoadPlane, ground_homography, ground_jacobian, pixel_to_ground
 from reconstruction.objective import CameraProvider, ObservationGeometry
 from reconstruction.orientation import OrientationSettings, SilhouetteMatcher, estimate_heading
+from reconstruction.silhouette_fit import SilhouetteFitSettings, fit_pose, select_views
 from reconstruction.triangulation import triangulate_robust
 from reconstruction.truck_model import TruckModel
 
@@ -199,6 +200,13 @@ class TrackerSettings:
     model_length_sigma: float = 0.0                # погрешность длины модели (ед. мира) -> вдоль оси в ковариацию точки вывода
     mono_depth_shape_tol: float = 0.15             # |w-ratio − h-ratio| / ratio больше — рамка искажена, дальности нет
     lost_after_frames: int = 90                    # столько кадров только прогноза — уровень «потерян»
+    # Подгонка модели к контуру масок ≥2 камер (reconstruction/silhouette_fit.py): измерение (x, y) и курса
+    silhouette_fit: bool = False
+    # measure — (x, y) и курс в фильтр; heading — только курс; output — фильтр как без подгонки, а точка вывода
+    # на кадре берётся из подгонки к контуру (начальное приближение — оценка фильтра), если она удалась
+    silhouette_mode: str = "measure"
+    silhouette_gate_chi2: float = 13.8             # гейт (x, y) по NIS (χ², 2 ст. свободы)
+    silhouette_heading_gate: float = 3.0           # гейт курса: |невязка| ≤ k·√S
 
     @property
     def accel_to_units(self) -> float:
@@ -395,6 +403,7 @@ class CabTracker:
         self._prev_heading: float | None = None
         self._visual_bias = 0.0                             # увод кузова от направления скорости по силуэту, рад
         self._bias_updated = False
+        self._sf = SilhouetteFitSettings()
         self._verified: set[int] = set()                    # камеры, чья детекция после появления согласовалась с треком
         self._yaw_rate = 0.0                                # рад/с, сглаженная
         self._heading_var_report = self.heading_var         # дисперсия курса с систематикой (для весов и вывода)
@@ -759,6 +768,46 @@ class CabTracker:
                                        self.dims)
     # ---------------------------------------------------------------- доработка: вспомогательные измерения
 
+    def _silhouette_update(self, cameras, detections, prior, P_prior, valid, occluded, rejected):
+        """
+        Подгонка модели к контуру чистых масок (≥2 камер). Курс исправляется сразу (скалярный фильтр, гейт),
+        (x, y) возвращается как вспомогательное измерение с гейтом NIS. Возврат: (имя, функция, R, курс_обновлён)
+        или (None, None, None, курс_обновлён); None — подгонки не было.
+        """
+        s = self.s
+        clean = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
+        masks = {d[0]: d[6] for d, ok in zip(detections, clean) if ok and len(d) > 6 and d[6] is not None}
+        if len(masks) < self._sf.min_views:
+            return None
+        slope = float(self.heading_dir[2] / max(np.hypot(*self.heading_dir[:2]), 1e-9))
+        views = select_views(cameras, masks, prior[:3], self.heading, slope, self.model, self.dims, self._sf)
+        fit = fit_pose(views, prior[:3], self.heading, slope, self.model, self.dims, self._sf)
+        if not fit.ok:
+            return None
+        heading_updated = False
+        innovation = float(_wrap(fit.heading - self.heading))
+        S_h = self._heading_var_report + fit.covariance[2, 2]
+        if abs(innovation) <= s.silhouette_heading_gate * np.sqrt(S_h):
+            gain = self._heading_var_report / S_h
+            self.heading = float(_wrap(self.heading + gain * innovation))
+            self.heading_var = float((1 - gain) * self.heading_var)
+            self._heading_var_report = float((1 - gain) * self._heading_var_report)
+            d = np.array([np.cos(self.heading), np.sin(self.heading), slope])
+            self.heading_dir = d / np.linalg.norm(d)
+            heading_updated = True
+        Hm = np.zeros((2, self.n))
+        Hm[:, :2] = np.eye(2)
+        y = np.array([fit.x, fit.y])
+        R = fit.covariance[:2, :2]
+        r0 = y - prior[:2]
+        try:
+            nis = float(r0 @ np.linalg.solve(P_prior[:2, :2] + R, r0))
+        except np.linalg.LinAlgError:
+            nis = float("inf")
+        if nis > s.silhouette_gate_chi2:
+            return (None, None, None, heading_updated)
+        return ("silhouette", (lambda x, Hm=Hm, y=y: (y - Hm @ x, Hm)), R, heading_updated)
+
     def _plane_at(self, xy: np.ndarray) -> RoadPlane | None:
         return None if self.road is None else self.road.local_plane(np.asarray(xy, float)[:2])
 
@@ -1027,12 +1076,21 @@ class CabTracker:
                 usable[:] = False
             occluded_count = int((valid & (edge_weight == 0) & ~rejected[:, None]).sum())
             any_occluded = bool(occluded.any() or rejected.any())
+            clean_out = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
             used_cameras = int((usable.sum(axis=1) >= 3).sum())
 
             if s.visual_heading:
                 clean = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
                 visual, visual_used = self._visual_heading_update(frame, cameras, detections, prior[:3], clean)
                 if visual_used:
+                    direction = self._direction(prior)
+                    predicted = self._measure(prior[:3], direction, geometry)
+
+            silhouette_meas = None
+            if s.silhouette_fit and s.silhouette_mode != "output":
+                silhouette_meas = self._silhouette_update(cameras, detections, prior, P_prior, valid, occluded,
+                                                          rejected)
+                if silhouette_meas is not None and silhouette_meas[3]:
                     direction = self._direction(prior)
                     predicted = self._measure(prior[:3], direction, geometry)
 
@@ -1051,6 +1109,8 @@ class CabTracker:
                 aux, aux_rejected, aux_nis = self._aux_measurements(prior, P_prior, direction, cameras, detections,
                                                                     predicted, observed, usable, stereo)
 
+            if silhouette_meas is not None and silhouette_meas[0] is not None and s.silhouette_mode == "measure":
+                aux = list(aux) + [silhouette_meas[:3]]
             if usable.any() or point_used or aux:
                 conf = np.array([max(d[3], 1e-3) for d in detections])
                 ramp = np.array([
@@ -1160,9 +1220,21 @@ class CabTracker:
         self._prev_velocity = state[3:6].copy()
 
         direction = self._update_heading(state, dt)
+        out_center, out_heading_cov = state[:3], None
+        if s.silhouette_fit and s.silhouette_mode == "output" and detections:
+            masks = {d[0]: d[6] for d, ok in zip(detections, clean_out) if ok and len(d) > 6 and d[6] is not None}
+            if len(masks) >= self._sf.min_views:
+                slope = float(direction[2] / max(np.hypot(*direction[:2]), 1e-9))
+                views = select_views(cameras, masks, state[:3], self.heading, slope, self.model, self.dims, self._sf)
+                fit = fit_pose(views, state[:3], self.heading, slope, self.model, self.dims, self._sf)
+                if fit.ok:
+                    out_center = np.array([fit.x, fit.y, state[2]])
+                    d = np.array([np.cos(fit.heading), np.sin(fit.heading), slope])
+                    direction = d / np.linalg.norm(d)
+                    out_heading_cov = fit.covariance
         forward, side, up = truck_axes(direction[None, :])
         if self.model is not None:
-            points = self.model.to_world(state[:3], forward[0], side[0], up[0],
+            points = self.model.to_world(out_center, forward[0], side[0], up[0],
                                          np.vstack([self.model.csv_point, self.model.cab_center]))
             position, cab_center = points[0], points[1]
         else:

@@ -338,7 +338,7 @@ def main(argv=None):
                 continue
             valid = np.array([d.x1 > m, d.x2 < cfg.cameras.width - m, d.y1 > m, d.y2 < cfg.cameras.height - m])
             tuples.append((c, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence, (d.point_u, d.point_v),
-                           not d.unreliable, cur_polys.get(c) if cfg.orientation.enabled else None))
+                           not d.unreliable, cur_polys.get(c) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None))
         dt_frames = 1.0 if prev_f is None else float(f - prev_f)
         prev_f = f
         t0 = time.perf_counter()
