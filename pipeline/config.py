@@ -14,6 +14,15 @@
   tracker      фильтр Калмана (reconstruction/visibility.py)
   spline       скользящий B-сплайн (reconstruction/streaming_bspline.py)
   output       видео, графики, отчёты
+  orientation  курс по изображению: сопоставление силуэта модели с маской (reconstruction/orientation.py)
+  road         дорожная плоскость: fixed / online (по уверенным стереокадрам трека) и ограничение основания
+  homography   гомография дороги: точка основания -> (x, y) центра (reconstruction/ground.py)
+  mono_depth   дальность по известным габаритам модели
+  confirmation строгая инициализация (независимые камеры, угол лучей, невязка), передача между камерами
+  uncertainty  контроль неопределённости: коррекция после пределов, рост без стерео, систематика
+
+Новые разделы по умолчанию выключены: базовая конфигурация (вариант A) не меняется. Включаются
+независимо — для ablation (pipeline/variants.py).
 """
 
 import json
@@ -177,6 +186,73 @@ class OutputConfig:
 
 
 @dataclass
+class OrientationConfig:
+    enabled: bool = False
+    sigma_floor_deg: float = 15.0              # систематика силуэта (модель ≠ маска, склон) в квадратуре к СКО пика
+    gate: float = 3.0                          # невязка курса больше gate·√S — отклонить
+    max_step_deg: float = 5.0                  # поправка курса за кадр не больше
+    process_dps: float = 20.0                  # рост неопределённости курса, °/с
+    max_slip_deg: float = 35.0                 # на скорости визуальный курс не дальше этого от направления скорости
+    slip_speed_mps: float = 3.0
+    step_deg: float = 10.0                     # сетка курсов
+    min_iou: float = 0.55                      # маска хуже совпадает с моделью — камера не используется
+    min_axis_contrast: float = 0.04            # ось не выражена — измерения нет
+    min_front_margin: float = 0.03             # «перед/зад» не различим — только ось (±180°)
+
+
+@dataclass
+class RoadConfig:
+    mode: str = "none"                         # none | fixed | online
+    height_m: float = 0.0                      # fixed: высота дороги
+    sigma_m: float = 0.3                       # СКО высоты дороги (нижняя граница)
+    radius_m: float = 30.0                     # online: радиус локальной плоскости
+    min_points: int = 15
+    constraint: bool = False                   # слабое измерение «основание на дороге»
+    only_without_stereo: bool = True
+
+
+@dataclass
+class HomographyConfig:
+    enabled: bool = False
+    sigma_px: float = 6.0                      # СКО точки основания на изображении
+    inflation: float = 2.0                     # корреляция с рёбрами той же камеры
+    max_range_m: float = 150.0                 # рабочая область от камеры
+    only_without_stereo: bool = True
+
+
+@dataclass
+class MonoDepthConfig:
+    enabled: bool = False
+    rel_sigma: float = 0.08                    # относительная ошибка дальности (модель ≠ силуэт)
+    only_without_stereo: bool = True
+    shape_tol: float = 0.15                    # ширина и высота рамки дают разную дальность — не использовать
+
+
+@dataclass
+class ConfirmationConfig:
+    init_min_cameras: int = 2                  # независимых камер для инициализации
+    init_min_ray_angle_deg: float = 0.0        # 0 — без проверки угла
+    init_max_reproj_px: float = 0.0            # 0 — без проверки невязки
+    handoff_gate_chi2: float = 0.0             # 0 — без проверки камеры, только что увидевшей грузовик
+    aux_gate_chi2: float = 9.21                # гейт вспомогательных измерений (дорога, гомография, дальность)
+
+
+@dataclass
+class UncertaintyConfig:
+    clip_covariance: bool = False              # P += δδᵀ после физических пределов
+    no_stereo_q_growth_per_s: float = 0.0      # процессный шум растёт без стерео
+    no_stereo_q_max: float = 10.0
+    depth_sigma_growth_mps: float = 0.0        # рост СКО вдоль луча единственной камеры, м/с
+    model_sigma_px: float = 0.0                # несовпадение модели с силуэтом, px
+    calibration_sigma_px: float = 0.0          # погрешность калибровки/позы камеры, px
+    heading_in_edges: bool = False             # неопределённость курса — в ковариацию рёбер
+    heading_sigma_floor_deg: float = 0.0       # нижняя граница СКО курса (курс по скорости занижает её)
+    heading_turn_lag_s: float = 0.0            # СКО курса += скорость поворота × запаздывание
+    model_length_sigma_m: float = 0.0          # погрешность длины модели -> в ковариацию точки вывода (вдоль оси)
+    lost_after_frames: int = 90                # кадров только прогноза — уровень «потерян»
+
+
+@dataclass
 class StreamConfig:
     cameras: CamerasConfig = field(default_factory=CamerasConfig)
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -186,6 +262,12 @@ class StreamConfig:
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     spline: SplineConfig = field(default_factory=SplineConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    orientation: OrientationConfig = field(default_factory=OrientationConfig)
+    road: RoadConfig = field(default_factory=RoadConfig)
+    homography: HomographyConfig = field(default_factory=HomographyConfig)
+    mono_depth: MonoDepthConfig = field(default_factory=MonoDepthConfig)
+    confirmation: ConfirmationConfig = field(default_factory=ConfirmationConfig)
+    uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
 
     @classmethod
     def load(cls, path: Path | str | None = None, overrides: list[str] | None = None) -> "StreamConfig":

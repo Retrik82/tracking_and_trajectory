@@ -287,9 +287,11 @@ class Synchronizer:
 class PrecomputedDetector:
     """Детекции из кадра (режим detections) или из таблицы по (камера, кадр); simulate_ms — имитация стоимости."""
 
-    def __init__(self, table: dict[int, dict[int, Detection]] | None = None, simulate_ms: float = 0.0):
+    def __init__(self, table: dict[int, dict[int, Detection]] | None = None, simulate_ms: float = 0.0,
+                 polygons: dict[tuple[int, int], np.ndarray] | None = None):
         self.table = table or {}
         self.simulate_ms = simulate_ms
+        self.polygons = polygons or {}               # контуры масок (камера, кадр) — для курса по силуэту
         self.calls = 0
         self.images = 0
 
@@ -386,12 +388,25 @@ class TickRecord:
     smoothed_accel_mps2: float = float("nan")
     excluded: dict = field(default_factory=dict)
     rejected_cameras: list = field(default_factory=list)
+    # доработка: уровень наблюдения и неопределённость
+    observation_level: str = "none"
+    reference_cov_m2: np.ndarray = field(default_factory=lambda: np.full((3, 3), np.nan))   # ковариация точки вывода, м²
+    heading_std_deg: float = float("nan")
+    visual_heading_deg: float = float("nan")
+    visual_heading_used: bool = False
+    aux_used: list = field(default_factory=list)
+    aux_rejected: int = 0
+    aux_nis: list = field(default_factory=list)
+    frames_since_stereo: int = -1
+    clip_correction_m: float = 0.0
 
 
 TRACK_COLUMNS = ["frame", "t_s", "status", "quality", "x", "y", "z", "ref_x", "ref_y", "ref_z", "cab_x", "cab_y", "cab_z",
                  "vx", "vy", "vz", "speed_mps", "accel_mps2", "heading_deg", "position_std_m", "cams_detected",
                  "cams_used", "point_cams", "point_nis", "reproj_px", "active_cams", "detected_cams", "latency_ms",
-                 "smoothed_frame", "sx", "sy", "sz", "svx", "svy", "svz", "s_accel_mps2", "excluded", "rejected_cams"]
+                 "smoothed_frame", "sx", "sy", "sz", "svx", "svy", "svz", "s_accel_mps2", "excluded", "rejected_cams",
+                 "obs_level", "ref_std_m", "heading_std_deg", "visual_heading_deg", "visual_heading_used", "aux_used",
+                 "frames_since_stereo"]
 
 
 def record_to_row(r: TickRecord) -> dict:
@@ -409,10 +424,43 @@ def record_to_row(r: TickRecord) -> dict:
             "svx": r.smoothed_velocity_mps[0], "svy": r.smoothed_velocity_mps[1], "svz": r.smoothed_velocity_mps[2],
             "s_accel_mps2": r.smoothed_accel_mps2,
             "excluded": "; ".join(f"cam{c}: {why}" for c, why in r.excluded.items()),
-            "rejected_cams": " ".join(map(str, r.rejected_cameras))}
+            "rejected_cams": " ".join(map(str, r.rejected_cameras)),
+            "obs_level": r.observation_level,
+            "ref_std_m": float(np.sqrt(np.trace(r.reference_cov_m2[:2, :2]))) if np.all(np.isfinite(r.reference_cov_m2))
+            else float("nan"),
+            "heading_std_deg": r.heading_std_deg, "visual_heading_deg": r.visual_heading_deg,
+            "visual_heading_used": int(r.visual_heading_used), "aux_used": " ".join(r.aux_used),
+            "frames_since_stereo": r.frames_since_stereo}
 
 
 # ---------------------------------------------------------------- конвейер
+
+def upgrade_settings(cfg: StreamConfig) -> dict:
+    """Параметры доработки (курс по силуэту, дорога, гомография, дальность, подтверждение, неопределённость)."""
+    upm = cfg.cameras.units_per_meter
+    o, r, h, m, c, u = cfg.orientation, cfg.road, cfg.homography, cfg.mono_depth, cfg.confirmation, cfg.uncertainty
+    return dict(
+        visual_heading=o.enabled, visual_heading_sigma_floor_deg=o.sigma_floor_deg, visual_heading_gate=o.gate,
+        visual_heading_max_step_deg=o.max_step_deg, heading_process_dps=o.process_dps,
+        visual_heading_max_slip_deg=o.max_slip_deg, visual_heading_slip_speed_mps=o.slip_speed_mps,
+        road_mode=r.mode, road_height=r.height_m * upm, road_sigma=r.sigma_m * upm, road_radius=r.radius_m * upm,
+        road_min_points=r.min_points, road_constraint=r.constraint, road_only_without_stereo=r.only_without_stereo,
+        homography=h.enabled, homography_sigma_px=h.sigma_px, homography_inflation=h.inflation,
+        homography_max_range=h.max_range_m * upm, homography_only_without_stereo=h.only_without_stereo,
+        mono_depth=m.enabled, mono_depth_rel_sigma=m.rel_sigma, mono_depth_only_without_stereo=m.only_without_stereo,
+        aux_gate_chi2=c.aux_gate_chi2, init_min_cameras=c.init_min_cameras,
+        init_min_ray_angle_deg=c.init_min_ray_angle_deg,
+        init_max_reproj_px=c.init_max_reproj_px if c.init_max_reproj_px > 0 else float("inf"),
+        handoff_gate_chi2=c.handoff_gate_chi2,
+        clip_covariance=u.clip_covariance, no_stereo_q_growth_per_s=u.no_stereo_q_growth_per_s,
+        no_stereo_q_max=u.no_stereo_q_max, depth_sigma_growth_mps=u.depth_sigma_growth_mps,
+        model_sigma_px=u.model_sigma_px, calibration_sigma_px=u.calibration_sigma_px,
+        heading_in_edges=u.heading_in_edges, lost_after_frames=u.lost_after_frames,
+        heading_sigma_floor_deg=u.heading_sigma_floor_deg, heading_turn_lag_s=u.heading_turn_lag_s,
+        model_length_sigma=u.model_length_sigma_m * upm,
+        mono_depth_shape_tol=m.shape_tol,
+    )
+
 
 def build_components(cfg: StreamConfig, model: TruckModel | None):
     c = cfg.cameras
@@ -429,6 +477,7 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
         heading_rate_limit_dps=t.heading_rate_limit_dps, min_heading_speed_mps=t.heading_min_speed_mps,
         init_frames=t.init_frames, mono_init=t.mono_init, image_width=c.width, image_height=c.height,
         edge_inflation_with_point=cfg.triangulation.edge_inflation_with_point,
+        **upgrade_settings(cfg),
     )
     fusion = FusionSettings(mode=cfg.triangulation.mode, sigma_px=cfg.triangulation.sigma_px,
                             max_reproj_px=cfg.triangulation.max_reproj_px,
@@ -437,6 +486,10 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
                             covariance_inflation=cfg.triangulation.covariance_inflation,
                             units_per_meter=c.units_per_meter)
     tracker = CabTracker(tracker_settings, dims, model, fusion if cfg.triangulation.mode != "none" else None)
+    o = cfg.orientation
+    os_ = tracker.orientation_settings
+    os_.step_deg, os_.min_iou = o.step_deg, o.min_iou
+    os_.min_axis_contrast, os_.min_front_margin = o.min_axis_contrast, o.min_front_margin
     sc = cfg.scheduler
     scheduler = CameraScheduler(SchedulerSettings(
         enabled=sc.enabled, horizon_frames=sc.horizon_frames, margin_px=sc.margin_px, sigma_scale=sc.sigma_scale,
@@ -470,8 +523,9 @@ class StreamPipeline:
     def __init__(self, cfg: StreamConfig, data_dir: Path, out_dir: Path | None = None,
                  detections: dict[int, dict[int, Detection]] | None = None, num_frames: int | None = None,
                  model: TruckModel | None = None, pose_provider=None, visualizer=None, detector=None,
-                 source_delays: dict[int, int] | None = None):
+                 source_delays: dict[int, int] | None = None, polygons: dict | None = None):
         self.cfg = cfg
+        self.polygons = polygons or {}
         self.data_dir = Path(data_dir)
         self.out_dir = Path(out_dir or cfg.output.out_dir)
         self.detections = detections
@@ -533,7 +587,7 @@ class StreamPipeline:
                 raise ValueError(f"неизвестный режим {s.mode}")
         if self.detector is None:
             if s.mode == "detections":
-                self.detector = PrecomputedDetector(self.detections)
+                self.detector = PrecomputedDetector(self.detections, polygons=self.polygons)
             else:
                 self.detector = YoloAdapter(self.cfg.detector)
         for src in self.sources.values():
@@ -566,8 +620,9 @@ class StreamPipeline:
             if d is None:
                 continue
             valid = np.array([d.x1 > m, d.x2 < c.width - m, d.y1 > m, d.y2 < c.height - m])
+            poly = getattr(self.detector, "polygons", {}).get((cam, d.frame)) if cfg.orientation.enabled else None
             tuples.append((cam, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence,
-                           (d.point_u, d.point_v), not d.unreliable))
+                           (d.point_u, d.point_v), not d.unreliable, poly))
             cameras[cam] = cams_pose[cam]
 
         # фильтр
@@ -601,6 +656,11 @@ class StreamPipeline:
             est.position_std / upm if np.isfinite(est.position_std) else float("nan"), est.cameras, est.cameras_used,
             est.point_cameras, est.point_nis, est.reproj_px, plan.active, [cam for cam, d in dets.items() if d is not None],
             latency_ms, excluded=bundle.excluded, rejected_cameras=list(est.rejected_cameras),
+            observation_level=est.observation_level, reference_cov_m2=est.reference_covariance / upm ** 2,
+            heading_std_deg=float(np.degrees(est.heading_std)), visual_heading_deg=float(np.degrees(est.visual_heading)),
+            visual_heading_used=est.visual_heading_used, aux_used=list(est.aux_used), aux_rejected=est.aux_rejected,
+            aux_nis=list(est.aux_nis), frames_since_stereo=est.frames_since_stereo,
+            clip_correction_m=est.clip_correction / upm,
         )
         if smoothed is not None:
             rec.smoothed_index = smoothed.frame
@@ -865,6 +925,18 @@ class StreamVisualizer:
 
 # ---------------------------------------------------------------- запуск из командной строки
 
+def load_polygons(det_dir: Path, cameras: list[int]) -> dict[tuple[int, int], np.ndarray]:
+    """Контуры масок cam{N}_polygons.npz -> {(камера, кадр): (K, 2)}; нет файла — пусто."""
+    out = {}
+    for cam in cameras:
+        path = Path(det_dir) / f"cam{cam}_polygons.npz"
+        if path.exists():
+            with np.load(path) as z:
+                for k in z.files:
+                    out[(cam, int(k))] = z[k]
+    return out
+
+
 def load_detections_table(det_dir: Path, cameras: list[int]) -> tuple[dict[int, dict[int, Detection]], int]:
     table, num = {}, 0
     for cam in cameras:
@@ -909,14 +981,16 @@ def main(argv=None) -> None:
     if args.no_pacing:
         cfg.streaming.realtime_pacing = False
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    detections, num, detector = None, None, None
+    detections, num, detector, polygons = None, None, None, None
     if cfg.streaming.mode == "detections":
         det_dir = args.detections or (Path(cfg.output.out_dir) / "detections")
         detections, num = load_detections_table(det_dir, cfg.cameras.ids)
+        polygons = load_polygons(det_dir, cfg.cameras.ids) if cfg.orientation.enabled else None
         num = args.num_frames or num
     elif args.detections is not None:
         table, _ = load_detections_table(args.detections, cfg.cameras.ids)
-        detector = PrecomputedDetector(table)
+        detector = PrecomputedDetector(table, polygons=load_polygons(args.detections, cfg.cameras.ids)
+                                       if cfg.orientation.enabled else None)
         log.warning("replay/live с готовыми детекциями из %s: YOLO не запускается, время детекции не измеряется",
                     args.detections)
     visualizer = None
@@ -931,7 +1005,7 @@ def main(argv=None) -> None:
             pass
         visualizer = StreamVisualizer(cfg, Path(cfg.output.out_dir), cfg.output.video_cameras or cfg.cameras.ids, target)
     pipeline = StreamPipeline(cfg, args.data, Path(cfg.output.out_dir), detections, num, visualizer=visualizer,
-                              detector=detector)
+                              detector=detector, polygons=polygons)
     pipeline.run()
     perf = pipeline.performance()
     print(performance_markdown(perf))

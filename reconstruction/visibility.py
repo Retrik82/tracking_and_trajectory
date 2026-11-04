@@ -47,8 +47,16 @@ from reconstruction.cab_model import (
     truck_axes,
 )
 from reconstruction.camera import Camera
-from reconstruction.fusion import FusionSettings, PointMeasurement, build_point_measurement, silhouette_offsets
+from reconstruction.fusion import (
+    FusionSettings,
+    PointMeasurement,
+    build_point_measurement,
+    ray_angles_deg,
+    silhouette_offsets,
+)
+from reconstruction.ground import OnlineRoadModel, RoadPlane, ground_homography, ground_jacobian, pixel_to_ground
 from reconstruction.objective import CameraProvider, ObservationGeometry
+from reconstruction.orientation import OrientationSettings, SilhouetteMatcher, estimate_heading
 from reconstruction.triangulation import triangulate_robust
 from reconstruction.truck_model import TruckModel
 
@@ -124,6 +132,60 @@ class TrackerSettings:
     cab_center_back: float = CAB_CENTER_BACK
     cab_center_up: float = CAB_CENTER_UP
 
+    # ------------------------------------------------------------------ доработки (все выключены по умолчанию:
+    # базовый вариант A не меняется; включаются независимо для ablation, см. pipeline/config.py)
+    # Курс по изображению (reconstruction/orientation.py): сопоставление силуэта модели с маской
+    visual_heading: bool = False
+    visual_heading_sigma_floor_deg: float = 15.0   # систематика: модель ≠ силуэт, склон, тень в маске
+    visual_heading_gate: float = 3.0               # |невязка| > gate·√S — измерение отклоняется
+    visual_heading_max_step_deg: float = 5.0       # поправка курса за кадр не больше (одна маска не разворачивает)
+    heading_process_dps: float = 20.0              # случайное блуждание курса (рост его дисперсии), °/с
+    # Физическое ограничение: на скорости кузов не стоит поперёк движения (увод < max_slip). Визуальный курс,
+    # отклонённый от направления скорости больше, отклоняется — иначе ошибка «перед/зад» разворачивает трек
+    visual_heading_max_slip_deg: float = 35.0
+    visual_heading_slip_speed_mps: float = 3.0
+    # Дорожная плоскость: none | fixed (road_height) | online (по уверенным стереокадрам самого трека)
+    road_mode: str = "none"
+    road_height: float = 0.0                       # ед. мира, для fixed
+    road_sigma: float = 30.0                       # СКО высоты дороги (нижняя граница), ед. мира
+    road_radius: float = 3000.0                    # online: радиус локальной плоскости, ед. мира
+    road_min_points: int = 15
+    road_constraint: bool = False                  # слабое измерение «основание на дороге» (z центра)
+    road_only_without_stereo: bool = True          # …только когда нет стерео
+    # Гомография дороги: точка основания (низ рамки + поправка ракурса по модели) -> (x, y) центра
+    homography: bool = False
+    homography_sigma_px: float = 6.0
+    homography_inflation: float = 2.0              # коррелирована с рёбрами той же камеры
+    homography_max_range: float = 15000.0          # рабочая область, ед. мира от камеры
+    homography_only_without_stereo: bool = True
+    # Монокулярная дальность по габаритам модели (размер рамки против проекции модели)
+    mono_depth: bool = False
+    mono_depth_rel_sigma: float = 0.08             # относительная ошибка (модель ≠ силуэт, маска)
+    mono_depth_only_without_stereo: bool = True
+    aux_gate_chi2: float = 9.21                    # гейт вспомогательных измерений (χ², 99 % для 2 ст. свободы)
+    # Строгая инициализация: независимые камеры, угол лучей, невязка (0 / inf — как раньше)
+    init_min_cameras: int = 2
+    init_min_ray_angle_deg: float = 0.0
+    init_max_reproj_px: float = float("inf")
+    # Передача между камерами: детекция камеры, только что увидевшей грузовик, сверяется с ожидаемой
+    # проекцией трека по χ² центра рамки (0 — выключено)
+    handoff_gate_chi2: float = 0.0
+    # Неопределённость
+    clip_covariance: bool = False                  # после физических пределов P += δ δᵀ (δ — внесённая поправка)
+    no_stereo_q_growth_per_s: float = 0.0          # Q × (1 + g · секунд без стерео), не больше no_stereo_q_max
+    no_stereo_q_max: float = 10.0
+    depth_sigma_growth_mps: float = 0.0            # без стерео: рост СКО вдоль луча камеры, м за секунду
+    model_sigma_px: float = 0.0                    # несовпадение модели с силуэтом (в квадратуре к СКО ребра)
+    calibration_sigma_px: float = 0.0              # погрешность калибровки и позы камеры, px
+    heading_in_edges: bool = False                 # неопределённость курса -> в ковариацию рёбер
+    # Неопределённость курса по скорости занижена: курс отстаёт от поворота (сглаживание, предел скорости
+    # поворота) и шумит при малой скорости. Нижняя граница и член «запаздывание × скорость поворота»
+    heading_sigma_floor_deg: float = 0.0
+    heading_turn_lag_s: float = 0.0
+    model_length_sigma: float = 0.0                # погрешность длины модели (ед. мира) -> вдоль оси в ковариацию точки вывода
+    mono_depth_shape_tol: float = 0.15             # |w-ratio − h-ratio| / ratio больше — рамка искажена, дальности нет
+    lost_after_frames: int = 90                    # столько кадров только прогноза — уровень «потерян»
+
     @property
     def accel_to_units(self) -> float:
         """м/с² -> ед. мира/кадр²."""
@@ -194,6 +256,24 @@ def gate_detections(predicted: np.ndarray, observed: np.ndarray, settings: Track
     return (iou < settings.gate_iou) & (dist > settings.gate_distance) & np.all(np.isfinite(predicted), axis=1)
 
 
+def monocular_range(predicted_range: float, predicted_box: np.ndarray, observed_box: np.ndarray,
+                    shape_tol: float = 0.15, min_px: float = 8.0) -> float:
+    """
+    Дальность центра по известным габаритам: рамка проекции модели при прогнозной дальности r и курсе
+    против рамки детектора — размер обратно пропорционален дальности, r_изм = r · (w_пр + h_пр) / (w + h).
+    Курс и перспектива учтены тем, что прогнозная рамка — проекция самой 3D-модели, а не формула «H / h».
+    NaN, если рамка мала или ширина и высота дают разную дальность больше shape_tol (рамка обрезана,
+    закрыта или курс неверен — такое измерение исказило бы глубину). Рамки x1 x2 y1 y2.
+    """
+    ow, oh = observed_box[1] - observed_box[0], observed_box[3] - observed_box[2]
+    pw, ph = predicted_box[1] - predicted_box[0], predicted_box[3] - predicted_box[2]
+    if min(ow, oh) <= min_px or min(pw, ph) <= 0:
+        return float("nan")
+    if abs(pw / ow - ph / oh) > shape_tol * (pw + ph) / (ow + oh):
+        return float("nan")
+    return float(predicted_range * (pw + ph) / (ow + oh))
+
+
 @dataclass
 class FrameEstimate:
     frame: int
@@ -222,6 +302,17 @@ class FrameEstimate:
     reproj_by_camera: dict = field(default_factory=dict)
     dt_frames: float = 1.0
     quality: str = "none"                 # none | predicted | edges | point | point+edges
+    # --- уровень наблюдения и неопределённость (доработка)
+    observation_level: str = "none"       # multi | multi_partial | single | road | predicted | lost | initializing
+    reference_covariance: np.ndarray = field(default_factory=lambda: np.full((3, 3), np.nan))  # точки вывода, ед.²
+    heading_std: float = float("nan")     # СКО курса, радианы
+    visual_heading: float = float("nan")  # измеренный по силуэту курс, радианы (NaN — нет измерения)
+    visual_heading_used: bool = False
+    aux_used: list = field(default_factory=list)       # вспомогательные измерения: road, homography:N, depth:N
+    aux_rejected: int = 0
+    aux_nis: list = field(default_factory=list)
+    frames_since_stereo: int = -1
+    clip_correction: float = 0.0          # величина поправки физических пределов, ед. мира
 
     @property
     def timestamp_s(self) -> float:       # заполняется потоковым конвейером при наличии меток времени
@@ -275,6 +366,21 @@ class CabTracker:
         self._prev_velocity: np.ndarray | None = None
         self._accel_est = np.zeros(3)                       # сглаженное ускорение (модель cv), ед./кадр²
         self._offsets_cache: tuple = (None, None)
+        # --- доработка: курс с дисперсией, дорога, учёт стерео, статистика инициализаций
+        self.heading_var = np.radians(30.0) ** 2
+        self._matcher = SilhouetteMatcher(OrientationSettings(), model, None if model is not None else self.dims)
+        self.orientation_settings = self._matcher.s
+        prior = RoadPlane.horizontal(self.s.road_height, self.s.road_sigma) if self.s.road_mode == "fixed" else None
+        self.road = OnlineRoadModel(self.s.road_radius, self.s.road_min_points, sigma_floor=self.s.road_sigma,
+                                    prior=prior) \
+            if self.s.road_mode in ("fixed", "online") or self.s.road_constraint or self.s.homography else None
+        self._last_stereo: int | None = None
+        self.initializations = 0                            # сколько раз трек (пере)инициализирован
+        self.init_rejected = 0                              # стереоточек отклонено строгой проверкой
+        self._prev_heading: float | None = None
+        self._verified: set[int] = set()                    # камеры, чья детекция после появления согласовалась с треком
+        self._yaw_rate = 0.0                                # рад/с, сглаженная
+        self._heading_var_report = self.heading_var         # дисперсия курса с систематикой (для весов и вывода)
 
     # ---------------------------------------------------------------- модель движения
 
@@ -334,7 +440,73 @@ class CabTracker:
             slope = 0.0
         d = np.array([np.cos(self.heading), np.sin(self.heading), slope])
         self.heading_dir = d / np.linalg.norm(d)
+        self._update_heading_variance(state, dt, speed)
         return self.heading_dir
+
+    def _update_heading_variance(self, state: np.ndarray, dt: float, speed: float) -> None:
+        """
+        Дисперсия курса: растёт как случайное блуждание (heading_process_dps), уменьшается информацией
+        направления скорости — дисперсия направления = поперечная дисперсия скорости / скорость²
+        (при малой скорости направление скорости неинформативно). Не меньше (0.5°)², не больше (90°)².
+        """
+        s = self.s
+        self.heading_var += (np.radians(s.heading_process_dps) / s.fps * max(dt, 1e-6)) ** 2
+        v = state[3:5]
+        norm = float(np.linalg.norm(v))
+        if self.P is not None and speed >= s.min_heading_speed_mps and norm > 1e-9:
+            lateral = np.array([-v[1], v[0]]) / norm
+            var_dir = float(lateral @ self.P[3:5, 3:5] @ lateral) / norm ** 2
+            if var_dir > 0:
+                self.heading_var = 1.0 / (1.0 / self.heading_var + 1.0 / var_dir)
+        # скорость поворота курса (сглаженная) — для члена запаздывания
+        if self._prev_heading is not None:
+            step = float(_wrap(self.heading - self._prev_heading)) / max(dt, 1e-6)
+            self._yaw_rate = 0.8 * self._yaw_rate + 0.2 * abs(step) * s.fps
+        self._prev_heading = self.heading
+        floor = np.radians(s.heading_sigma_floor_deg) ** 2 + (self._yaw_rate * s.heading_turn_lag_s) ** 2
+        self._heading_var_report = float(np.clip(self.heading_var + floor, np.radians(0.5) ** 2, np.radians(90.0) ** 2))
+        self.heading_var = float(np.clip(self.heading_var, np.radians(0.5) ** 2, np.radians(90.0) ** 2))
+
+    def _visual_heading_update(self, frame: int, cameras: dict[int, Camera], detections, center: np.ndarray,
+                               clean: np.ndarray):
+        """
+        Курс по силуэту (orientation.py) по камерам с чистыми рамками (все рёбра в кадре и не закрыты, не
+        отброшены гейтом) — объединение с курсом трека по весам дисперсий. Если «перед/зад» не определён,
+        из двух направлений берётся ближайшее к курсу трека. Невязка больше gate·√S — измерение отклоняется
+        (одна ошибочная маска не разворачивает модель); поправка за кадр ограничена.
+        """
+        s = self.s
+        views = [(d[0], cameras[d[0]], d[6], max(float(d[3]), 1e-3)) for d, ok in zip(detections, clean)
+                 if ok and len(d) > 6 and d[6] is not None]
+        if not views:
+            return None, False
+        self._matcher.slope = float(self.heading_dir[2] / max(np.hypot(*self.heading_dir[:2]), 1e-9))
+        m = estimate_heading(self._matcher, views, center)
+        if not m.ok:
+            return m, False
+        innovation = float(_wrap(m.heading - self.heading))
+        if m.axis_only and abs(innovation) > np.pi / 2:
+            innovation = float(_wrap(innovation + np.pi))
+        v = self.state[3:5] if self.state is not None else np.zeros(2)
+        if self._speed_mps(self.state) >= s.visual_heading_slip_speed_mps:
+            new = self.heading + innovation
+            slip = abs(float(_wrap(new - np.arctan2(v[1], v[0]))))
+            if slip > np.radians(s.visual_heading_max_slip_deg):
+                return m, False
+        var_m = m.sigma ** 2 + np.radians(s.visual_heading_sigma_floor_deg) ** 2
+        S = self._heading_var_report + var_m
+        if abs(innovation) > s.visual_heading_gate * np.sqrt(S):
+            return m, False
+        gain = self._heading_var_report / S
+        step = float(np.clip(gain * innovation, -np.radians(s.visual_heading_max_step_deg),
+                             np.radians(s.visual_heading_max_step_deg)))
+        self.heading = float(_wrap(self.heading + step))
+        self.heading_var = float((1 - gain) * self.heading_var)
+        self._heading_var_report = float((1 - gain) * self._heading_var_report)
+        slope = self.heading_dir[2] / max(np.hypot(*self.heading_dir[:2]), 1e-9)
+        d = np.array([np.cos(self.heading), np.sin(self.heading), slope])
+        self.heading_dir = d / np.linalg.norm(d)
+        return m, True
 
     def _direction(self, state: np.ndarray) -> np.ndarray:
         """Текущее направление «вперёд» (без изменения курса)."""
@@ -379,7 +551,7 @@ class CabTracker:
         reliable = [d for d in detections if d[5] and d[4] is not None]
         if len(reliable) >= 2:
             res = triangulate_robust([cameras[d[0]] for d in reliable], [tuple(d[4]) for d in reliable])
-            if res.ok:
+            if res.ok and self._confirm_point(res, [cameras[d[0]] for d in reliable], [d[0] for d in reliable]):
                 self._init_buffer.append((frame, res.point))
         elif len(reliable) == 1 and self.s.mono_init and allow_mono:
             p = self._mono_point(cameras[reliable[0][0]], reliable[0])
@@ -433,7 +605,33 @@ class CabTracker:
         self.P = np.diag(diag) ** 2
         self._confirmed = not mono
         self._init_buffer = []
+        self.initializations += 1
+        self.heading_var = np.radians(30.0 if not mono else 90.0) ** 2
+        self._heading_var_report = self.heading_var
         return True
+
+    def _confirm_point(self, res, cams: list[Camera], cam_ids: list[int]) -> bool:
+        """
+        Строгая проверка стереоточки для инициализации: независимых (разных) камер-инлаеров не меньше
+        init_min_cameras, лучи пересекаются под углом не меньше init_min_ray_angle_deg (почти параллельные
+        лучи глубины не дают), невязка инлаеров не больше init_max_reproj_px, точка перед камерами.
+        """
+        s = self.s
+        inl = [i for i, k in enumerate(res.inliers) if k]
+        ids = {cam_ids[i] for i in inl}
+        ok = len(ids) >= max(s.init_min_cameras, 2)
+        if ok and s.init_min_ray_angle_deg > 0:
+            angles = ray_angles_deg([cams[i] for i in inl], res.point)
+            ok = len(angles) > 0 and float(angles.max()) >= s.init_min_ray_angle_deg
+        if ok and np.isfinite(s.init_max_reproj_px):
+            err = np.asarray(res.reprojection_errors, float)[inl]
+            ok = bool(np.all(np.isfinite(err)) and err.max() <= s.init_max_reproj_px)
+        strict = s.init_min_cameras > 2 or s.init_min_ray_angle_deg > 0 or np.isfinite(s.init_max_reproj_px)
+        if ok and strict:
+            ok = all(cams[i].depth(res.point) > 0 for i in inl)
+        if not ok:
+            self.init_rejected += 1
+        return ok
 
     # ---------------------------------------------------------------- измерения
 
@@ -499,6 +697,185 @@ class CabTracker:
             return None
         return build_point_measurement(cameras, centroids, self.fusion, prior[:3], direction, self.model,
                                        self.dims)
+    # ---------------------------------------------------------------- доработка: вспомогательные измерения
+
+    def _plane_at(self, xy: np.ndarray) -> RoadPlane | None:
+        return None if self.road is None else self.road.local_plane(np.asarray(xy, float)[:2])
+
+    def expected_view(self, camera: Camera, P: np.ndarray | None = None) -> dict:
+        """
+        Ожидаемая проекция текущего состояния в камеру (передача между камерами): рамка x1 x2 y1 y2,
+        центр рамки и его ковариация (J P Jᵀ, px²), видна ли рамка в кадре, ожидаемый курс.
+        """
+        if self.state is None:
+            return {"visible": False}
+        P = self.P if P is None else P
+        geometry = ObservationGeometry.from_cameras([camera])
+        direction = self.heading_dir
+        box = self._measure(self.state[:3], direction, geometry)[0]
+        center_px = np.array([(box[0] + box[1]) / 2, (box[2] + box[3]) / 2])
+        f = lambda x: (lambda b: np.array([(b[0] + b[1]) / 2, (b[2] + b[3]) / 2]))(  # noqa: E731
+            self._measure(x[:3], direction, geometry)[0])
+        J = _numeric_jacobian(f, self.state[:3].copy(), np.full(3, 1.0))
+        cov = J @ P[:3, :3] @ J.T
+        s = self.s
+        inside = bool(box[1] > 0 and box[0] < s.image_width and box[3] > 0 and box[2] < s.image_height
+                      and camera.depth(self.state[:3]) > 0)
+        return {"visible": inside, "box": box, "center_px": center_px, "center_cov": cov,
+                "heading": float(self.heading), "heading_std": float(np.sqrt(self._heading_var_report))}
+
+    def _handoff_rejects(self, frame: int, cameras: dict[int, Camera], detections, P_prior: np.ndarray,
+                         predicted: np.ndarray, observed: np.ndarray) -> np.ndarray:
+        """
+        Камера, (снова) увидевшая грузовик, проверяется по ожидаемой проекции трека, пока её детекция не
+        согласуется с ней: χ² центра рамки с ковариацией J P Jᵀ + (СКО ребра² + (0.15·размер)²) больше
+        handoff_gate_chi2 — отклонить (не больше половины детекций тика — см. step).
+        Новый трек из-за перехода между камерами не создаётся: состояние в мировой системе общее.
+        """
+        s = self.s
+        out = np.zeros(len(detections), bool)
+        if s.handoff_gate_chi2 <= 0 or not self._confirmed:
+            return out
+        for i, d in enumerate(detections):
+            # камера проверяется, пока не дала согласованной с прогнозом детекции после появления
+            if self._appeared.get(d[0]) == frame:
+                self._verified.discard(d[0])
+            if d[0] in self._verified:
+                continue
+            view = self.expected_view(cameras[d[0]], P_prior)
+            if not view.get("visible", False):
+                continue
+            size = max(predicted[i, 1] - predicted[i, 0], predicted[i, 3] - predicted[i, 2], 1.0)
+            S = view["center_cov"] + np.eye(2) * (s.edge_sigma_px ** 2 + (0.15 * size) ** 2)
+            r = np.array([(observed[i, 0] + observed[i, 1]) / 2, (observed[i, 2] + observed[i, 3]) / 2]) \
+                - np.array([(predicted[i, 0] + predicted[i, 1]) / 2, (predicted[i, 2] + predicted[i, 3]) / 2])
+            out[i] = float(r @ np.linalg.solve(S, r)) > s.handoff_gate_chi2
+            if not out[i]:
+                self._verified.add(d[0])
+        return out
+
+    def _pixel_sigma2(self, conf: float) -> float:
+        s = self.s
+        return s.homography_sigma_px ** 2 / max(conf, 1e-3) + s.model_sigma_px ** 2 + s.calibration_sigma_px ** 2
+
+    def _aux_measurements(self, prior: np.ndarray, P_prior: np.ndarray, direction: np.ndarray,
+                          cameras: dict[int, Camera], detections, predicted: np.ndarray, observed: np.ndarray,
+                          usable: np.ndarray, stereo: bool) -> tuple[list, int, list]:
+        """
+        Вспомогательные измерения (каждое: имя, функция x -> (невязка, H), R):
+        - road: основание на дорожной плоскости, z центра = z дороги + H/2 (1 ст. свободы);
+        - homography:N: точка основания по гомографии -> (x, y) центра (2 ст. свободы);
+        - depth:N: дальность центра от камеры по размеру рамки против проекции модели (1 ст. свободы).
+        Каждое проходит гейт по NIS против прогноза; конфликт гомографии и дальности одной камеры —
+        остаётся то, что лучше согласуется с прогнозом (не слепое усреднение).
+        """
+        s = self.s
+        out, nis_list = [], []
+        n = self.n
+        plane = self._plane_at(prior[:2]) if (s.road_constraint or s.homography) else None
+        half_h = float(self.dims[2]) / 2
+        heading_std = float(np.sqrt(self._heading_var_report))
+        if s.road_constraint and plane is not None and (not s.road_only_without_stereo or not stereo):
+            sx, sy = plane.slope()
+            Hm = np.zeros((1, n))
+            Hm[0, :3] = [-sx, -sy, 1.0]
+            y = np.array([plane.point[2] - sx * plane.point[0] - sy * plane.point[1] + half_h])
+            R = np.array([[max(plane.sigma, s.road_sigma) ** 2]])
+            out.append(("road", (lambda x, Hm=Hm, y=y: (y - Hm @ x, Hm)), R))
+        by_cam: dict[int, dict] = {}
+        for i, d in enumerate(detections):
+            cam = cameras[d[0]]
+            conf = max(float(d[3]), 1e-3)
+            if s.homography and plane is not None and (not s.homography_only_without_stereo or not stereo) \
+                    and usable[i, 0] and usable[i, 1] and usable[i, 3]:
+                h = ground_homography(cam, plane)
+                foot = prior[:3] - half_h * plane.normal
+                pF = cam.project(foot)
+                pB = np.array([(predicted[i, 0] + predicted[i, 1]) / 2, predicted[i, 3]])
+                q = np.array([(observed[i, 0] + observed[i, 1]) / 2, observed[i, 3]]) + (pF - pB)
+                X, ok = pixel_to_ground(h, q[None, :], s.homography_max_range)
+                if h.ok and ok[0] and np.all(np.isfinite(pF)):
+                    J = ground_jacobian(h, q)[:2]
+                    lever = float(np.linalg.norm(pF - pB)) * heading_std
+                    sig2 = (self._pixel_sigma2(conf) + lever ** 2) * s.homography_inflation
+                    ray = X[0] - cam.position
+                    g = ray[:2] / max(abs(ray[2]), 1e-6)
+                    R = J @ J.T * sig2 + np.outer(g, g) * max(plane.sigma, s.road_sigma) ** 2
+                    Hm = np.zeros((2, n))
+                    Hm[:, :2] = np.eye(2)
+                    y = X[0, :2] + 0.0
+                    by_cam.setdefault(d[0], {})["homography"] = (f"homography:{d[0]}",
+                                                                 (lambda x, Hm=Hm, y=y: (y - Hm @ x, Hm)), R)
+            if s.mono_depth and (not s.mono_depth_only_without_stereo or not stereo) and usable[i].all():
+                C = cam.position
+                r_pred = float(np.linalg.norm(prior[:3] - C))
+                r_m = monocular_range(r_pred, predicted[i], observed[i], s.mono_depth_shape_tol)
+                ow, oh = observed[i, 1] - observed[i, 0], observed[i, 3] - observed[i, 2]
+                pw, ph = predicted[i, 1] - predicted[i, 0], predicted[i, 3] - predicted[i, 2]
+                if np.isfinite(r_m):
+                    # чувствительность размера рамки к курсу -> в ошибку дальности
+                    geom = ObservationGeometry.from_cameras([cam])
+                    dh = np.radians(2.0)
+                    rot = np.array([np.cos(self.heading + dh), np.sin(self.heading + dh), direction[2]])
+                    b2 = self._measure(prior[:3], rot / np.linalg.norm(rot), geom)[0]
+                    dsize = abs((b2[1] - b2[0] + b2[3] - b2[2]) - (pw + ph)) / dh
+                    rel2 = (s.mono_depth_rel_sigma ** 2 + 2 * self._pixel_sigma2(conf) / (ow + oh) ** 2
+                            + (dsize * heading_std / (pw + ph)) ** 2)
+                    R = np.array([[rel2 * r_m ** 2]])
+
+                    def fn(x, C=C, r_m=r_m):
+                        diff = x[:3] - C
+                        r = float(np.linalg.norm(diff))
+                        Hm = np.zeros((1, n))
+                        Hm[0, :3] = diff / max(r, 1e-9)
+                        return np.array([r_m - r]), Hm
+                    by_cam.setdefault(d[0], {})["depth"] = (f"depth:{d[0]}", fn, R)
+        rejected = 0
+        accepted = []
+        gates = {1: 6.63, 2: 9.21, 3: 11.34}
+        scale = s.aux_gate_chi2 / 9.21
+        candidates = list(out) + [m for cam_meas in by_cam.values() for m in cam_meas.values()]
+        nis_by_name = {}
+        for name, fn, R in candidates:
+            r0, H0 = fn(prior)
+            S = H0 @ P_prior @ H0.T + R
+            try:
+                nis = float(r0 @ np.linalg.solve(S, r0))
+            except np.linalg.LinAlgError:
+                nis = float("inf")
+            nis_by_name[name] = nis
+            nis_list.append(nis)
+            if nis > gates.get(len(r0), 11.34) * scale:
+                rejected += 1
+                continue
+            accepted.append((name, fn, R))
+        # конфликт гомографии и дальности одной камеры: дальности по ним расходятся больше 3σ
+        names = {a[0] for a in accepted}
+        for cid, cam_meas in by_cam.items():
+            if "homography" in cam_meas and "depth" in cam_meas and \
+                    cam_meas["homography"][0] in names and cam_meas["depth"][0] in names:
+                hname, hfn, hR = cam_meas["homography"]
+                dname, dfn, dR = cam_meas["depth"]
+                C = cameras[cid].position
+                xy = hfn(np.zeros(n))[0]                           # y − H·0 = (x, y) гомографии
+                p_h = np.r_[xy, prior[2]]
+                r_h = float(np.linalg.norm(p_h - C))
+                u = (p_h - C)[:2] / max(np.linalg.norm((p_h - C)[:2]), 1e-9)
+                var_rh = float(u @ hR @ u)
+                r_m = float(dfn(np.r_[C + (p_h - C), np.zeros(n - 3)])[0][0] + r_h)
+                if abs(r_h - r_m) > 3 * np.sqrt(var_rh + dR[0, 0]):
+                    drop = hname if nis_by_name[hname] > nis_by_name[dname] else dname
+                    accepted = [a for a in accepted if a[0] != drop]
+                    rejected += 1
+        return accepted, rejected, nis_list
+
+    @staticmethod
+    def _psd(P: np.ndarray) -> np.ndarray:
+        P = (P + P.T) / 2
+        w, v = np.linalg.eigh(P)
+        if w.min() >= 0:
+            return P
+        return (v * np.maximum(w, 1e-9)) @ v.T
 
     # ---------------------------------------------------------------- шаг
 
@@ -506,6 +883,7 @@ class CabTracker:
         """
         Один тик. dt_frames — шаг времени в кадрах (по умолчанию — разность номеров кадров,
         минимум 1); при потоковой обработке передавайте (t − t_prev)·fps.
+        Детекция — кортеж (камера, рамка, рёбра в кадре, уверенность, центроид, надёжна[, контур маски]).
         """
         s = self.s
         for d in detections:
@@ -522,9 +900,10 @@ class CabTracker:
         if self.state is None:
             if not self._try_initialize(frame, cameras, detections):
                 return FrameEstimate(frame, INITIALIZING, nan3, nan3, nan3, np.nan, np.nan, np.nan,
-                                     len(detections), 0, 0, -1, dt_frames=dt)
+                                     len(detections), 0, 0, -1, dt_frames=dt, observation_level=INITIALIZING)
             prior, P_prior = self.state.copy(), self.P.copy()
             previous_velocity = prior[3:6].copy()
+            self._last_stereo = frame
         elif (not self._confirmed or self._bad_streak >= s.reinit_after_bad_frames) \
                 and self._try_initialize(frame, cameras, detections, allow_mono=False):
             # стерео стало доступно (после старта по одной камере) или трек разошёлся: состояние
@@ -532,11 +911,17 @@ class CabTracker:
             prior, P_prior = self.state.copy(), self.P.copy()
             previous_velocity = prior[3:6].copy()
             self._bad_streak = 0
+            self._last_stereo = frame
         else:
             previous_velocity = self.state[3:6].copy()
             F = self._transition(dt)
             prior = F @ self.state
-            P_prior = F @ self.P @ F.T + self._process_noise(dt)
+            Q = self._process_noise(dt)
+            if s.no_stereo_q_growth_per_s > 0 and self._last_stereo is not None:
+                # без стерео прогноз всё менее надёжен: процессный шум растёт со временем без 3D
+                seconds = (frame - self._last_stereo) / s.fps
+                Q = Q * min(1.0 + s.no_stereo_q_growth_per_s * seconds, s.no_stereo_q_max)
+            P_prior = F @ self.P @ F.T + Q
 
         state, P = prior, P_prior
         occluded_count, used_cameras = 0, 0
@@ -546,6 +931,11 @@ class CabTracker:
         nis = float("nan")
         reproj_by_camera: dict[int, float] = {}
         direction = self._direction(prior)
+        visual, visual_used = None, False
+        aux, aux_rejected, aux_nis = [], 0, []
+        clip_correction = 0.0
+        stereo = False
+        any_occluded = False
         if detections:
             cam_ids = [d[0] for d in detections]
             geometry = ObservationGeometry.from_cameras([cameras[c] for c in cam_ids])
@@ -559,6 +949,7 @@ class CabTracker:
                          and frame - self._last_confirmed <= s.gate_max_age
                          and np.sqrt(P_prior[0, 0] + P_prior[1, 1]) / s.units_per_meter < s.gate_max_std_m)
             rejected = gate_detections(predicted, observed, s) if confident else np.zeros(len(detections), bool)
+            rejected |= self._handoff_rejects(frame, cameras, detections, P_prior, predicted, observed)
             if rejected.sum() * 2 > len(detections):
                 rejected[:] = False
             rejected_cameras = [int(c) for c, r in zip(cam_ids, rejected) if r]
@@ -567,7 +958,15 @@ class CabTracker:
             if not s.use_edges:
                 usable[:] = False
             occluded_count = int(occluded.sum())
+            any_occluded = bool(occluded.any() or rejected.any())
             used_cameras = int((usable.sum(axis=1) >= 3).sum())
+
+            if s.visual_heading:
+                clean = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
+                visual, visual_used = self._visual_heading_update(frame, cameras, detections, prior[:3], clean)
+                if visual_used:
+                    direction = self._direction(prior)
+                    predicted = self._measure(prior[:3], direction, geometry)
 
             accepted = [d for d, r in zip(detections, rejected) if not r]
             point = self._point_measurement(prior, direction, cameras, accepted)
@@ -579,8 +978,12 @@ class CabTracker:
                 except np.linalg.LinAlgError:
                     nis = float("inf")
                 point_used = nis <= s.point_gate_nis
+            stereo = used_cameras >= 2 or point_used
+            if s.road_constraint or s.homography or s.mono_depth:
+                aux, aux_rejected, aux_nis = self._aux_measurements(prior, P_prior, direction, cameras, detections,
+                                                                    predicted, observed, usable, stereo)
 
-            if usable.any() or point_used:
+            if usable.any() or point_used or aux:
                 conf = np.array([max(d[3], 1e-3) for d in detections])
                 ramp = np.array([
                     s.reappear_min_weight + (1 - s.reappear_min_weight)
@@ -591,12 +994,22 @@ class CabTracker:
                 mask = usable.ravel()
                 observed_flat = observed.ravel()[mask]
                 R_edges = np.repeat(s.edge_sigma_px / np.sqrt(conf * ramp) * np.sqrt(inflate), 4)[mask] ** 2
+                # систематические источники в квадратуре: несовпадение модели и силуэта, калибровка камеры
+                R_edges = R_edges + s.model_sigma_px ** 2 + s.calibration_sigma_px ** 2
+                if s.heading_in_edges and mask.any():
+                    # неопределённость курса: (∂ребро/∂курс)² · σ²_курса
+                    dh = np.radians(2.0)
+                    rot = np.array([np.cos(self.heading + dh), np.sin(self.heading + dh), direction[2]])
+                    rot /= np.linalg.norm(rot)
+                    d_edges = (self._measure(prior[:3], rot, geometry) - self._measure(prior[:3], direction, geometry))
+                    R_edges = R_edges + (d_edges.ravel()[mask] / dh) ** 2 * self._heading_var_report
                 P_inv = np.linalg.inv(P_prior)
                 measure = lambda x: self._measure(x[:3], direction, geometry).ravel()[mask]  # noqa: E731
                 n_edges = int(mask.sum())
                 H_point = np.zeros((3, self.n))
                 H_point[:, :3] = np.eye(3)
                 R_point_inv = np.linalg.inv(point.covariance) if point_used else None
+                aux_inv = [(fn, np.linalg.inv(R)) for _, fn, R in aux]
                 state = prior.copy()
                 for _ in range(max(1, s.update_iterations)):
                     information = P_inv.copy()
@@ -615,6 +1028,10 @@ class CabTracker:
                         residual_p = point.point - state[:3]
                         information += H_point.T @ R_point_inv @ H_point
                         gradient += H_point.T @ R_point_inv @ (residual_p + H_point @ (state - prior))
+                    for fn, R_inv in aux_inv:
+                        residual_a, H_a = fn(state)
+                        information += H_a.T @ R_inv @ H_a
+                        gradient += H_a.T @ R_inv @ (residual_a + H_a @ (state - prior))
                     new_state = prior + np.linalg.solve(information, gradient)
                     converged = np.max(np.abs(new_state[:3] - state[:3])) < 1.0
                     state = new_state
@@ -622,7 +1039,14 @@ class CabTracker:
                         break
                 P = np.linalg.inv(information)
                 P = (P + P.T) / 2
+                unclipped = state
                 state = self._apply_limits(prior, state, previous_velocity, dt)
+                correction = state - unclipped
+                clip_correction = float(np.linalg.norm(correction[:3]))
+                if s.clip_covariance and np.any(correction != 0):
+                    # ограничение сдвинуло состояние: ковариация не может остаться «как без поправки» —
+                    # консервативно добавляем внесённую поправку (P + δδᵀ), положительная полуопределённость
+                    P = self._psd(P + np.outer(correction, correction))
             # невязка рёбер после обновления — для планировщика камер и отчёта
             after = self._measure(state[:3], direction, geometry)
             res = np.abs(after - observed)
@@ -630,13 +1054,28 @@ class CabTracker:
                 m = usable[i]
                 reproj_by_camera[int(c)] = float(res[i][m].mean()) if m.any() else float("nan")
 
+            if not stereo and s.depth_sigma_growth_mps > 0 and self._last_stereo is not None and used_cameras:
+                # одна камера: глубина вдоль её луча не наблюдается — СКО вдоль луча растёт с временем без стерео
+                best = int(np.argmax(usable.sum(axis=1)))
+                ray = state[:3] - cameras[cam_ids[best]].position
+                ray /= max(np.linalg.norm(ray), 1e-9)
+                t1 = (frame - self._last_stereo) / s.fps
+                t0 = max(t1 - dt / s.fps, 0.0)
+                rate = s.depth_sigma_growth_mps * s.units_per_meter
+                P = P.copy()
+                P[:3, :3] += ((rate * t1) ** 2 - (rate * t0) ** 2) * np.outer(ray, ray)
+
         self.state, self.P = state, P
         bad = (point is not None and point.ok and not point_used) or len(rejected_cameras) >= 2
         self._bad_streak = self._bad_streak + 1 if bad else 0
         if used_cameras >= 2 or point_used:
             self._confirmed = True
             self._last_confirmed = frame
-        status = MEASURED if (used_cameras or point_used) else (PARTIAL if detections else PREDICTED)
+        if stereo:
+            self._last_stereo = frame
+            if self.road is not None and s.road_mode != "fixed" and used_cameras >= 2:
+                self.road.add(state[:3] - np.array([0.0, 0.0, float(self.dims[2]) / 2]))
+        status = MEASURED if (used_cameras or point_used or aux) else (PARTIAL if detections else PREDICTED)
         if status == MEASURED:
             self._last_measured = frame
         since = 0 if self._last_measured is None else frame - self._last_measured
@@ -668,6 +1107,22 @@ class CabTracker:
                    else "edges" if used_cameras else "predicted" if detections == [] else "partial")
         if not self._confirmed:
             quality = "mono"                                # трек по одной камере, не подтверждён второй
+        # уровень наблюдения: что реально измерено на этом кадре
+        if stereo:
+            level = "multi_partial" if any_occluded else "multi"
+        elif used_cameras == 1:
+            level = "single"
+        elif aux:
+            level = "road"
+        else:
+            level = "lost" if since >= s.lost_after_frames else "predicted"
+        # ковариация точки вывода: центр + рычаг (точка вывода смещена от центра) × неопределённость курса
+        lever = position - state[:3]
+        j = np.array([-lever[1], lever[0], 0.0])
+        ref_cov = P[:3, :3] + self._heading_var_report * np.outer(j, j)
+        if s.model_length_sigma > 0:
+            # точка вывода на краю модели: ошибка длины сдвигает её вдоль оси на половину ошибки
+            ref_cov = ref_cov + (s.model_length_sigma / 2) ** 2 * np.outer(forward[0], forward[0])
         return FrameEstimate(
             frame, status, position, state[:3].copy(), cab_center, speed, float(self.heading),
             float(np.sqrt(P[0, 0] + P[1, 1])), len(detections), used_cameras, occluded_count, since,
@@ -677,6 +1132,11 @@ class CabTracker:
             point_nis=nis, point_std_m=point.std_m if point is not None else float("nan"),
             reproj_px=float(np.mean(reproj_vals)) if reproj_vals else float("nan"),
             reproj_by_camera=reproj_by_camera, dt_frames=dt, quality=quality,
+            observation_level=level, reference_covariance=ref_cov, heading_std=float(np.sqrt(self._heading_var_report)),
+            visual_heading=float(visual.heading) if visual is not None and visual.ok else float("nan"),
+            visual_heading_used=visual_used, aux_used=[a[0] for a in aux], aux_rejected=aux_rejected,
+            aux_nis=aux_nis, frames_since_stereo=-1 if self._last_stereo is None else frame - self._last_stereo,
+            clip_correction=clip_correction,
         )
 
 
