@@ -112,6 +112,33 @@ class FrameSource:
         with self._cv:
             return self.queue[-1] if self.queue else None
 
+    def pop_at(self, t: float, tol: float, max_age_s: float | None = None) -> Frame | None:
+        """
+        Кадр с меткой, ближайшей к t (в пределах tol); он и более старые кадры удаляются, более новые
+        остаются для следующих тиков. Устаревшие по max_age отбрасываются. None — подходящего кадра нет.
+        """
+        with self._cv:
+            now = time.perf_counter()
+            while self.queue and max_age_s is not None and self.queue[0].image is not None \
+                    and now - self.queue[0].captured_at > max_age_s:
+                self.queue.popleft()
+                self.dropped += 1
+            if not self.queue:
+                return None
+            best = min(range(len(self.queue)), key=lambda i: abs(self.queue[i].timestamp - t))
+            if abs(self.queue[best].timestamp - t) > tol:
+                # всё, что старше окна допуска, уже не понадобится
+                while self.queue and self.queue[0].timestamp < t - tol:
+                    self.queue.popleft()
+                    self.dropped += 1
+                return None
+            for _ in range(best):
+                self.queue.popleft()
+                self.dropped += 1
+            f = self.queue.popleft()
+            self._cv.notify_all()
+            return f
+
     def wait(self, timeout: float) -> bool:
         with self._cv:
             if self.queue or self.done:
@@ -274,6 +301,59 @@ class Synchronizer:
                 and time.perf_counter() - frame.captured_at > self.max_age)
 
     def next_bundle(self) -> Bundle | None:
+        if any(not s.lossless for s in self.sources.values()):
+            return self._next_bundle_aligned()
+        return self._next_bundle_ordered()
+
+    def _next_bundle_aligned(self) -> Bundle | None:
+        """
+        Поток в реальном темпе: у каждой камеры в очереди несколько последних кадров. Опорная метка —
+        самая ранняя из «самых новых» меток камер (самая отстающая камера), и у КАЖДОЙ камеры берётся
+        кадр с ближайшей к ней меткой. Раньше брался самый новый кадр каждой камеры: за время тика камеры
+        уходили вперёд на разное число кадров (±1 кадр = 33 мс > допуска 20 мс), и до половины камер
+        выпадало как «рассинхронизация» — трекеру доставалось ~1 камера на тик вместо ~2.3.
+        """
+        deadline = time.perf_counter() + self.wait_s
+        while True:
+            newest = {c: f for c, s in self.sources.items() if (f := s.peek()) is not None}
+            if newest:
+                break
+            if all(s.done for s in self.sources.values()):
+                return None
+            for s in self.sources.values():
+                if not s.done:
+                    s.wait(0.01)
+            if time.perf_counter() > deadline:
+                return None
+        # дать отстающим камерам кадр текущего момента
+        wait_until = time.perf_counter() + min(self.wait_s, 2.0 / self.fps)
+        while time.perf_counter() < wait_until:
+            missing = [c for c, s in self.sources.items() if c not in newest and not s.done]
+            if not missing:
+                break
+            self.sources[missing[0]].wait(0.002)
+            newest = {c: f for c, s in self.sources.items() if (f := s.peek()) is not None}
+        t_ref = min(f.timestamp for f in newest.values())
+        if self.last_index >= 0:
+            t_ref = max(t_ref, (self.last_index + 1) / self.fps - self.tol)
+        frames, excluded = {}, {}
+        for cam, src in self.sources.items():
+            f = src.pop_at(t_ref, self.tol, self.max_age)
+            if f is not None:
+                frames[cam] = f
+            elif cam in newest:
+                excluded[cam] = f"нет кадра в допуске {self.tol * 1000:.0f} мс"
+        self.excluded_total += len(excluded)
+        if not frames:
+            return self._next_bundle_aligned()
+        t_ref = min(f.timestamp for f in frames.values())
+        index = int(round(t_ref * self.fps))
+        if index <= self.last_index:
+            index = self.last_index + 1
+        self.last_index = index
+        return Bundle(index, t_ref, frames, excluded)
+
+    def _next_bundle_ordered(self) -> Bundle | None:
         # подтянуть новые кадры
         deadline = time.perf_counter() + self.wait_s
         while True:
@@ -516,6 +596,8 @@ def upgrade_settings(cfg: StreamConfig) -> dict:
         heading_sigma_floor_deg=u.heading_sigma_floor_deg, heading_turn_lag_s=u.heading_turn_lag_s,
         model_length_sigma=u.model_length_sigma_m * upm,
         mono_depth_shape_tol=m.shape_tol,
+        silhouette_fit=cfg.silhouette.enabled, silhouette_gate_chi2=cfg.silhouette.gate_chi2,
+        silhouette_mode=cfg.silhouette.mode,
     )
 
 
@@ -530,6 +612,9 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
         vertical_accel_noise_mps2=t.vertical_accel_noise_mps2, jerk_noise_mps3=t.jerk_noise_mps3,
         use_edges=t.use_edges, edge_sigma_px=t.edge_sigma_px, huber_k=t.huber_k,
         occlusion_hold_frames=t.occlusion_hold_frames, occlusion_ramp_frames=t.occlusion_ramp_frames,
+        occlusion_size_ratio=t.occlusion_size_ratio,
+        heading_output_rate_limit=t.heading_output_rate_limit, min_turn_radius_m=t.min_turn_radius_m,
+        heading_accel_limit_dps2=t.heading_accel_limit_dps2,
         max_longitudinal_mps2=t.max_longitudinal_mps2, max_lateral_mps2=t.max_lateral_mps2,
         max_correction_per_frame=t.max_correction_per_frame_m * c.units_per_meter,
         heading_rate_limit_dps=t.heading_rate_limit_dps, min_heading_speed_mps=t.heading_min_speed_mps,
@@ -544,6 +629,9 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
                             covariance_inflation=cfg.triangulation.covariance_inflation,
                             units_per_meter=c.units_per_meter)
     tracker = CabTracker(tracker_settings, dims, model, fusion if cfg.triangulation.mode != "none" else None)
+    sf, sc_ = tracker._sf, cfg.silhouette
+    sf.min_views, sf.area_ratio_min, sf.inflation = sc_.min_views, sc_.area_ratio_min, sc_.inflation
+    sf.prior_sigma, sf.prior_sigma_heading_deg = sc_.prior_sigma_m * c.units_per_meter, sc_.prior_sigma_heading_deg
     o = cfg.orientation
     os_ = tracker.orientation_settings
     os_.step_deg, os_.min_iou = o.step_deg, o.min_iou
@@ -710,7 +798,7 @@ class StreamPipeline:
             if d is None:
                 continue
             valid = np.array([d.x1 > m, d.x2 < c.width - m, d.y1 > m, d.y2 < c.height - m])
-            poly = getattr(self.detector, "polygons", {}).get((cam, d.frame)) if cfg.orientation.enabled else None
+            poly = getattr(self.detector, "polygons", {}).get((cam, d.frame)) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None
             tuples.append((cam, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence,
                            (d.point_u, d.point_v), not d.unreliable, poly))
             cameras[cam] = cams_pose[cam]
@@ -1102,12 +1190,12 @@ def main(argv=None) -> None:
     if cfg.streaming.mode == "detections":
         det_dir = args.detections or (Path(cfg.output.out_dir) / "detections")
         detections, num = load_detections_table(det_dir, cfg.cameras.ids)
-        polygons = load_polygons(det_dir, cfg.cameras.ids) if cfg.orientation.enabled else None
+        polygons = load_polygons(det_dir, cfg.cameras.ids) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None
         num = args.num_frames or num
     elif args.detections is not None:
         table, _ = load_detections_table(args.detections, cfg.cameras.ids)
         detector = PrecomputedDetector(table, polygons=load_polygons(args.detections, cfg.cameras.ids)
-                                       if cfg.orientation.enabled else None)
+                                       if (cfg.orientation.enabled or cfg.silhouette.enabled) else None)
         log.warning("replay/live с готовыми детекциями из %s: YOLO не запускается, время детекции не измеряется",
                     args.detections)
     visualizer = None

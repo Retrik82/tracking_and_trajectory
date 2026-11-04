@@ -58,6 +58,7 @@ from reconstruction.fusion import (
 from reconstruction.ground import OnlineRoadModel, RoadPlane, ground_homography, ground_jacobian, pixel_to_ground
 from reconstruction.objective import CameraProvider, ObservationGeometry
 from reconstruction.orientation import OrientationSettings, SilhouetteMatcher, estimate_heading
+from reconstruction.silhouette_fit import SilhouetteFitSettings, fit_pose, select_views
 from reconstruction.triangulation import triangulate_robust
 from reconstruction.truck_model import TruckModel
 
@@ -199,6 +200,24 @@ class TrackerSettings:
     model_length_sigma: float = 0.0                # погрешность длины модели (ед. мира) -> вдоль оси в ковариацию точки вывода
     mono_depth_shape_tol: float = 0.15             # |w-ratio − h-ratio| / ratio больше — рамка искажена, дальности нет
     lost_after_frames: int = 90                    # столько кадров только прогноза — уровень «потерян»
+    # Подгонка модели к контуру масок ≥2 камер (reconstruction/silhouette_fit.py): измерение (x, y) и курса
+    # Срезанная рамка по размеру: рамка камеры уже (ниже) проекции модели больше чем в size_ratio раз — край
+    # срезан перекрытием; срезанным считается ребро, сильнее отклонившееся от прогноза (отставание прогноза сдвигает
+    # оба ребра одинаково, перекрытие — одно). 0 — выключено
+    occlusion_size_ratio: float = 0.0
+    # Физический предел поворота для ИТОГОВОГО курса (включая поправки по силуэту и контуру, которые иначе
+    # обходят предел): за кадр не больше (v / R_min + heading_rate_floor) · dt. Без него курс на медленном повороте
+    # дёргался до 11°/кадр, а точка вывода в 11 м от центра прыгала на ~2 м. 0 — выключено
+    heading_output_rate_limit: bool = False
+    heading_rate_floor_dps: float = 5.0
+    heading_accel_limit_dps2: float = 0.0          # предел изменения скорости поворота (руль не перекладывается
+                                                   # мгновенно туда-обратно — убирает зигзаг курса), °/с²; 0 — выкл.
+    silhouette_fit: bool = False
+    # measure — (x, y) и курс в фильтр; heading — только курс; output — фильтр как без подгонки, а точка вывода
+    # на кадре берётся из подгонки к контуру (начальное приближение — оценка фильтра), если она удалась
+    silhouette_mode: str = "measure"
+    silhouette_gate_chi2: float = 13.8             # гейт (x, y) по NIS (χ², 2 ст. свободы)
+    silhouette_heading_gate: float = 3.0           # гейт курса: |невязка| ≤ k·√S
 
     @property
     def accel_to_units(self) -> float:
@@ -395,6 +414,9 @@ class CabTracker:
         self._prev_heading: float | None = None
         self._visual_bias = 0.0                             # увод кузова от направления скорости по силуэту, рад
         self._bias_updated = False
+        self._sf = SilhouetteFitSettings()
+        self._out_heading: float | None = None              # курс прошлого кадра (для предела поворота)
+        self._out_yaw_rate = 0.0                            # скорость поворота итогового курса, рад/кадр
         self._verified: set[int] = set()                    # камеры, чья детекция после появления согласовалась с треком
         self._yaw_rate = 0.0                                # рад/с, сглаженная
         self._heading_var_report = self.heading_var         # дисперсия курса с систематикой (для весов и вывода)
@@ -759,6 +781,61 @@ class CabTracker:
                                        self.dims)
     # ---------------------------------------------------------------- доработка: вспомогательные измерения
 
+    def _size_cut_edges(self, predicted: np.ndarray, observed: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        """Рёбра (M, 4), срезанные перекрытием, по отношению размеров рамки детектора и прогнозной рамки."""
+        out = np.zeros_like(valid)
+        r = self.s.occlusion_size_ratio
+        for i in range(len(observed)):
+            for a, b in ((0, 1), (2, 3)):
+                pw, ow = predicted[i, b] - predicted[i, a], observed[i, b] - observed[i, a]
+                if pw <= 0 or ow >= r * pw:
+                    continue
+                da, db = observed[i, a] - predicted[i, a], predicted[i, b] - observed[i, b]   # внутрь — положительно
+                k = a if da > db else b
+                if valid[i, k]:
+                    out[i, k] = True
+        return out
+
+    def _silhouette_update(self, cameras, detections, prior, P_prior, valid, occluded, rejected):
+        """
+        Подгонка модели к контуру чистых масок (≥2 камер). Курс исправляется сразу (скалярный фильтр, гейт),
+        (x, y) возвращается как вспомогательное измерение с гейтом NIS. Возврат: (имя, функция, R, курс_обновлён)
+        или (None, None, None, курс_обновлён); None — подгонки не было.
+        """
+        s = self.s
+        clean = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
+        masks = {d[0]: d[6] for d, ok in zip(detections, clean) if ok and len(d) > 6 and d[6] is not None}
+        if len(masks) < self._sf.min_views:
+            return None
+        slope = float(self.heading_dir[2] / max(np.hypot(*self.heading_dir[:2]), 1e-9))
+        views = select_views(cameras, masks, prior[:3], self.heading, slope, self.model, self.dims, self._sf)
+        fit = fit_pose(views, prior[:3], self.heading, slope, self.model, self.dims, self._sf)
+        if not fit.ok:
+            return None
+        heading_updated = False
+        innovation = float(_wrap(fit.heading - self.heading))
+        S_h = self._heading_var_report + fit.covariance[2, 2]
+        if abs(innovation) <= s.silhouette_heading_gate * np.sqrt(S_h):
+            gain = self._heading_var_report / S_h
+            self.heading = float(_wrap(self.heading + gain * innovation))
+            self.heading_var = float((1 - gain) * self.heading_var)
+            self._heading_var_report = float((1 - gain) * self._heading_var_report)
+            d = np.array([np.cos(self.heading), np.sin(self.heading), slope])
+            self.heading_dir = d / np.linalg.norm(d)
+            heading_updated = True
+        Hm = np.zeros((2, self.n))
+        Hm[:, :2] = np.eye(2)
+        y = np.array([fit.x, fit.y])
+        R = fit.covariance[:2, :2]
+        r0 = y - prior[:2]
+        try:
+            nis = float(r0 @ np.linalg.solve(P_prior[:2, :2] + R, r0))
+        except np.linalg.LinAlgError:
+            nis = float("inf")
+        if nis > s.silhouette_gate_chi2:
+            return (None, None, None, heading_updated)
+        return ("silhouette", (lambda x, Hm=Hm, y=y: (y - Hm @ x, Hm)), R, heading_updated)
+
     def _plane_at(self, xy: np.ndarray) -> RoadPlane | None:
         return None if self.road is None else self.road.local_plane(np.asarray(xy, float)[:2])
 
@@ -946,8 +1023,12 @@ class CabTracker:
         Детекция — кортеж (камера, рамка, рёбра в кадре, уверенность, центроид, надёжна[, контур маски]).
         """
         s = self.s
+        # «снова увидела» — камеры не было на ПРЕДЫДУЩЕМ ТИКЕ (а не на кадре t − 1): в реальном темпе тики
+        # идут через несколько кадров, и иначе каждая камера каждый тик считалась бы только что появившейся
+        # (пониженный вес и проверка передачи на всех детекциях)
+        prev_tick = self._last_frame if self._last_frame is not None else frame - 1
         for d in detections:
-            if self._last_seen.get(d[0], -10 ** 9) < frame - 1:
+            if self._last_seen.get(d[0], -10 ** 9) < prev_tick:
                 self._appeared[d[0]] = frame
             self._last_seen[d[0]] = frame
         if dt_frames is None:
@@ -1023,12 +1104,27 @@ class CabTracker:
                 usable[:] = False
             occluded_count = int((valid & (edge_weight == 0) & ~rejected[:, None]).sum())
             any_occluded = bool(occluded.any() or rejected.any())
+            clean_out = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
+            if s.occlusion_size_ratio > 0:
+                cut = self._size_cut_edges(predicted, observed, valid) & usable
+                if cut.any() and ((usable & ~cut).sum(axis=1) >= 3).sum() >= 1:
+                    usable = usable & ~cut
+                    occluded = occluded | cut
+                    occluded_count += int(cut.sum())
             used_cameras = int((usable.sum(axis=1) >= 3).sum())
 
             if s.visual_heading:
                 clean = valid.all(axis=1) & ~occluded.any(axis=1) & ~rejected
                 visual, visual_used = self._visual_heading_update(frame, cameras, detections, prior[:3], clean)
                 if visual_used:
+                    direction = self._direction(prior)
+                    predicted = self._measure(prior[:3], direction, geometry)
+
+            silhouette_meas = None
+            if s.silhouette_fit and s.silhouette_mode != "output":
+                silhouette_meas = self._silhouette_update(cameras, detections, prior, P_prior, valid, occluded,
+                                                          rejected)
+                if silhouette_meas is not None and silhouette_meas[3]:
                     direction = self._direction(prior)
                     predicted = self._measure(prior[:3], direction, geometry)
 
@@ -1047,6 +1143,8 @@ class CabTracker:
                 aux, aux_rejected, aux_nis = self._aux_measurements(prior, P_prior, direction, cameras, detections,
                                                                     predicted, observed, usable, stereo)
 
+            if silhouette_meas is not None and silhouette_meas[0] is not None and s.silhouette_mode == "measure":
+                aux = list(aux) + [silhouette_meas[:3]]
             if usable.any() or point_used or aux:
                 conf = np.array([max(d[3], 1e-3) for d in detections])
                 ramp = np.array([
@@ -1055,53 +1153,55 @@ class CabTracker:
                     for d in detections])
                 inflate = np.array([s.edge_inflation_with_point if point_used and c in point.cameras else 1.0
                                     for c in cam_ids])
-                mask = usable.ravel()
-                observed_flat = observed.ravel()[mask]
-                R_edges = (np.repeat(s.edge_sigma_px / np.sqrt(conf * ramp) * np.sqrt(inflate), 4) ** 2
-                           / np.maximum(edge_weight.ravel(), 1e-6))[mask]
-                # систематические источники в квадратуре: несовпадение модели и силуэта, калибровка камеры
-                R_edges = R_edges + s.model_sigma_px ** 2 + s.calibration_sigma_px ** 2
-                if s.heading_in_edges and mask.any():
-                    # неопределённость курса: (∂ребро/∂курс)² · σ²_курса
-                    dh = np.radians(2.0)
-                    rot = np.array([np.cos(self.heading + dh), np.sin(self.heading + dh), direction[2]])
-                    rot /= np.linalg.norm(rot)
-                    d_edges = (self._measure(prior[:3], rot, geometry) - self._measure(prior[:3], direction, geometry))
-                    R_edges = R_edges + (d_edges.ravel()[mask] / dh) ** 2 * self._heading_var_report
-                P_inv = np.linalg.inv(P_prior)
-                measure = lambda x: self._measure(x[:3], direction, geometry).ravel()[mask]  # noqa: E731
-                n_edges = int(mask.sum())
-                H_point = np.zeros((3, self.n))
-                H_point[:, :3] = np.eye(3)
-                R_point_inv = np.linalg.inv(point.covariance) if point_used else None
-                aux_inv = [(fn, np.linalg.inv(R)) for _, fn, R in aux]
-                state = prior.copy()
-                for _ in range(max(1, s.update_iterations)):
-                    information = P_inv.copy()
-                    gradient = np.zeros(self.n)
-                    if n_edges:
-                        Hm = np.zeros((n_edges, self.n))
-                        steps = np.zeros(self.n)
-                        steps[:3] = 1.0
-                        Hm[:, :3] = _numeric_jacobian(measure, state, steps)[:, :3]
-                        residual = observed_flat - measure(state)
-                        S_diag = np.einsum("ij,jk,ik->i", Hm, P_prior, Hm) + R_edges
-                        R = R_edges * np.maximum(1.0, np.abs(residual) / np.sqrt(S_diag) / s.huber_k)
-                        information += Hm.T @ (Hm / R[:, None])
-                        gradient += Hm.T @ ((residual + Hm @ (state - prior)) / R)
-                    if point_used:
-                        residual_p = point.point - state[:3]
-                        information += H_point.T @ R_point_inv @ H_point
-                        gradient += H_point.T @ R_point_inv @ (residual_p + H_point @ (state - prior))
-                    for fn, R_inv in aux_inv:
-                        residual_a, H_a = fn(state)
-                        information += H_a.T @ R_inv @ H_a
-                        gradient += H_a.T @ R_inv @ (residual_a + H_a @ (state - prior))
-                    new_state = prior + np.linalg.solve(information, gradient)
-                    converged = np.max(np.abs(new_state[:3] - state[:3])) < 1.0
-                    state = new_state
-                    if converged:
-                        break
+                for _ in range(1):
+                    mask = usable.ravel()
+                    observed_flat = observed.ravel()[mask]
+                    R_edges = (np.repeat(s.edge_sigma_px / np.sqrt(conf * ramp) * np.sqrt(inflate), 4) ** 2
+                               / np.maximum(edge_weight.ravel(), 1e-6))[mask]
+                    # систематические источники в квадратуре: несовпадение модели и силуэта, калибровка камеры
+                    R_edges = R_edges + s.model_sigma_px ** 2 + s.calibration_sigma_px ** 2
+                    if s.heading_in_edges and mask.any():
+                        # неопределённость курса: (∂ребро/∂курс)² · σ²_курса
+                        dh = np.radians(2.0)
+                        rot = np.array([np.cos(self.heading + dh), np.sin(self.heading + dh), direction[2]])
+                        rot /= np.linalg.norm(rot)
+                        d_edges = (self._measure(prior[:3], rot, geometry) - self._measure(prior[:3], direction, geometry))
+                        R_edges = R_edges + (d_edges.ravel()[mask] / dh) ** 2 * self._heading_var_report
+                    P_inv = np.linalg.inv(P_prior)
+                    measure = lambda x: self._measure(x[:3], direction, geometry).ravel()[mask]  # noqa: E731
+                    n_edges = int(mask.sum())
+                    H_point = np.zeros((3, self.n))
+                    H_point[:, :3] = np.eye(3)
+                    R_point_inv = np.linalg.inv(point.covariance) if point_used else None
+                    aux_inv = [(fn, np.linalg.inv(R)) for _, fn, R in aux]
+                    state = prior.copy()
+                    for _ in range(max(1, s.update_iterations)):
+                        information = P_inv.copy()
+                        gradient = np.zeros(self.n)
+                        if n_edges:
+                            Hm = np.zeros((n_edges, self.n))
+                            steps = np.zeros(self.n)
+                            steps[:3] = 1.0
+                            Hm[:, :3] = _numeric_jacobian(measure, state, steps)[:, :3]
+                            residual = observed_flat - measure(state)
+                            S_diag = np.einsum("ij,jk,ik->i", Hm, P_prior, Hm) + R_edges
+                            R = R_edges * np.maximum(1.0, np.abs(residual) / np.sqrt(S_diag) / s.huber_k)
+                            information += Hm.T @ (Hm / R[:, None])
+                            gradient += Hm.T @ ((residual + Hm @ (state - prior)) / R)
+                        if point_used:
+                            residual_p = point.point - state[:3]
+                            information += H_point.T @ R_point_inv @ H_point
+                            gradient += H_point.T @ R_point_inv @ (residual_p + H_point @ (state - prior))
+                        for fn, R_inv in aux_inv:
+                            residual_a, H_a = fn(state)
+                            information += H_a.T @ R_inv @ H_a
+                            gradient += H_a.T @ R_inv @ (residual_a + H_a @ (state - prior))
+                        new_state = prior + np.linalg.solve(information, gradient)
+                        converged = np.max(np.abs(new_state[:3] - state[:3])) < 1.0
+                        state = new_state
+                        if converged:
+                            break
+                    break
                 P = np.linalg.inv(information)
                 P = (P + P.T) / 2
                 unclipped = state
@@ -1156,9 +1256,38 @@ class CabTracker:
         self._prev_velocity = state[3:6].copy()
 
         direction = self._update_heading(state, dt)
+        if s.heading_output_rate_limit and self._out_heading is not None:
+            speed_ms = self._speed_mps(state)
+            rate = speed_ms / max(s.min_turn_radius_m, 0.1) + np.radians(s.heading_rate_floor_dps)
+            lim = rate / s.fps * max(dt, 1e-6)
+            delta = float(_wrap(self.heading - self._out_heading))
+            if s.heading_accel_limit_dps2 > 0:
+                dw = np.radians(s.heading_accel_limit_dps2) / s.fps ** 2 * max(dt, 1e-6) ** 2
+                delta = float(np.clip(delta, self._out_yaw_rate * dt - dw, self._out_yaw_rate * dt + dw))
+            delta = float(np.clip(delta, -lim, lim))
+            self._out_yaw_rate = delta / max(dt, 1e-6)
+            if delta != float(_wrap(self.heading - self._out_heading)):
+                self.heading = float(_wrap(self._out_heading + delta))
+                d = np.array([np.cos(self.heading), np.sin(self.heading), self.heading_dir[2]
+                              / max(np.hypot(*self.heading_dir[:2]), 1e-9)])
+                self.heading_dir = d / np.linalg.norm(d)
+                direction = self.heading_dir
+        self._out_heading = self.heading
+        out_center, out_heading_cov = state[:3], None
+        if s.silhouette_fit and s.silhouette_mode == "output" and detections:
+            masks = {d[0]: d[6] for d, ok in zip(detections, clean_out) if ok and len(d) > 6 and d[6] is not None}
+            if len(masks) >= self._sf.min_views:
+                slope = float(direction[2] / max(np.hypot(*direction[:2]), 1e-9))
+                views = select_views(cameras, masks, state[:3], self.heading, slope, self.model, self.dims, self._sf)
+                fit = fit_pose(views, state[:3], self.heading, slope, self.model, self.dims, self._sf)
+                if fit.ok:
+                    out_center = np.array([fit.x, fit.y, state[2]])
+                    d = np.array([np.cos(fit.heading), np.sin(fit.heading), slope])
+                    direction = d / np.linalg.norm(d)
+                    out_heading_cov = fit.covariance
         forward, side, up = truck_axes(direction[None, :])
         if self.model is not None:
-            points = self.model.to_world(state[:3], forward[0], side[0], up[0],
+            points = self.model.to_world(out_center, forward[0], side[0], up[0],
                                          np.vstack([self.model.csv_point, self.model.cab_center]))
             position, cab_center = points[0], points[1]
         else:

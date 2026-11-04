@@ -286,24 +286,26 @@ def main(argv=None):
         target = None
     source.start()
 
-    # масштаб — по траектории (эталон только задаёт рамку картинки); камеры за рамкой не рисуются
+    # рамка карты — все камеры и траектория (эталон только задаёт рамку картинки); сверху место под подпись
+    pts = [make_camera(args.data, c, 0).position[:2] for c in cams_ids]
     if target is not None:
-        pts = np.array(target.positions[target.valid][:, :2])
-    else:
-        pts = np.array([make_camera(args.data, c, 0).position[:2] for c in cams_ids])
+        pts += list(target.positions[target.valid][:, :2])
+    pts = np.array(pts)
     lo, hi = pts.min(0), pts.max(0)
-    pad = 0.08 * (hi - lo)
+    pad = 0.06 * (hi - lo) + 1500.0                  # запас под значок камеры и подпись
     lo, hi = lo - pad, hi + pad
-    MAP = (640, 360)
+    MAP_TOP = 28
+    MAP = (640, 360 - MAP_TOP)
     k = min(MAP[0] / (hi[0] - lo[0]), MAP[1] / (hi[1] - lo[1]))
 
     def to_map(xy):
         xy = np.atleast_2d(xy)
         return np.c_[(xy[:, 0] - lo[0]) * k + (MAP[0] - (hi[0] - lo[0]) * k) / 2,
-                     MAP[1] - ((xy[:, 1] - lo[1]) * k + (MAP[1] - (hi[1] - lo[1]) * k) / 2)]
+                     MAP_TOP + MAP[1] - ((xy[:, 1] - lo[1]) * k + (MAP[1] - (hi[1] - lo[1]) * k) / 2)]
 
     f_big, f_mid, f_small = font(28), font(21), font(16)
     trail = deque(maxlen=90)
+    err_hist, ax_hist = [], ([], [], [])
     est_path, gt_path = [], []
     writer = None
     if args.save:
@@ -336,7 +338,7 @@ def main(argv=None):
                 continue
             valid = np.array([d.x1 > m, d.x2 < cfg.cameras.width - m, d.y1 > m, d.y2 < cfg.cameras.height - m])
             tuples.append((c, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence, (d.point_u, d.point_v),
-                           not d.unreliable, cur_polys.get(c) if cfg.orientation.enabled else None))
+                           not d.unreliable, cur_polys.get(c) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None))
         dt_frames = 1.0 if prev_f is None else float(f - prev_f)
         prev_f = f
         t0 = time.perf_counter()
@@ -429,25 +431,44 @@ def main(argv=None):
         px, py = 1280 + 18, 360 + 12
         upm = cfg.cameras.units_per_meter
         ref_r = np.sqrt(np.trace(est.reference_covariance[:2, :2]) * 5.991 / 2) / upm if ok else float("nan")
-        lines = [
+        W, Y, G, B, D = (230, 230, 230), (255, 220, 120), (120, 220, 120), (160, 200, 255), (170, 170, 170)
+        if np.isfinite(err):
+            err_hist.append(err)
+        eh = np.array(err_hist)
+        xyz = lambda v: " / ".join(f"{c:8.2f}" for c in v / upm)  # noqa: E731
+        d = (est.position - gt) / upm if ok and np.all(np.isfinite(gt)) else np.full(3, np.nan)
+        col1 = [
             (f"Кадр {f} / {n - 1}   t = {f / cfg.cameras.fps:5.2f} с", f_big, (255, 255, 255)),
-            (name, f_small, (160, 200, 255)),
-            (f"Наблюдение: {LEVEL_RU.get(est.observation_level, est.observation_level)}", f_mid, (230, 230, 230)),
-            (f"Камер с детекцией: {est.cameras}, в обновлении: {est.cameras_used}", f_mid, (230, 230, 230)),
+            (name, f_small, B),
+            (f"Наблюдение: {LEVEL_RU.get(est.observation_level, est.observation_level)}", f_mid, W),
+            (f"Камер с детекцией: {est.cameras}, в обновлении: {est.cameras_used}", f_mid, W),
             (f"Скорость: {est.speed_mps * 3.6:5.1f} км/ч   курс: {np.degrees(est.heading):6.1f}°" if ok else "Скорость: —",
-             f_mid, (230, 230, 230)),
-            (f"Неопределённость: 95 % в радиусе ~{ref_r:4.1f} м, курс ±{np.degrees(est.heading_std):4.1f}°" if ok else "",
-             f_mid, (120, 220, 120)),
-            (f"Ошибка против эталона CSV: {err:5.2f} м" if np.isfinite(err) else "Ошибка: —", f_mid, (255, 220, 120)),
-            (f"Детектор: {det_ms:4.0f} мс   трекер: {tick_ms:4.1f} мс   обновлений: {fps:4.1f} /с", f_mid, (230, 230, 230)),
-            (f"Пропущено кадров (не успели обработать): {source.skipped / max(f + 1, 1) * 100:3.0f} %" if live
-             else "Обрабатывается каждый кадр", f_mid, (230, 230, 230)),
-            (f"Детекции: {det_name}; трекер видит только прошлое", f_small, (170, 170, 170)),
-            ("Синий — модель по оценке, жёлтый — точка CSV и след, красный — центр", f_small, (170, 170, 170)),
-            ("кабины, белый крест — эталон (только для сравнения), зелёный — маска", f_small, (170, 170, 170)),
+             f_mid, W),
         ]
-        # метрики — внизу на всю ширину, три колонки
-        cols = [lines[0:4], lines[4:8], lines[8:]]
+        col2 = [
+            ("Точка CSV, м:            X        /        Y        /        Z", f_small, D),
+            (f"Оценка:   {xyz(est.position)}" if ok else "Оценка: —", f_mid, W),
+            (f"Эталон:   {xyz(gt)}" if np.all(np.isfinite(gt)) else "Эталон: —", f_mid, D),
+            (f"Ошибка ΔX / ΔY / ΔZ:  {d[0]:+5.2f} / {d[1]:+5.2f} / {d[2]:+5.2f} м" if np.all(np.isfinite(d))
+             else "Ошибка: —", f_mid, Y),
+            (f"Ошибка 3D сейчас: {err:5.2f} м" if np.isfinite(err) else "Ошибка 3D: —", f_mid, Y),
+        ]
+        col3 = [
+            ("Точность за прогон (ошибка 3D, м):", f_small, D),
+            (f"медиана {np.median(eh):4.2f}   p95 {np.percentile(eh, 95):4.2f}   макс {eh.max():4.2f}" if len(eh)
+             else "—", f_mid, Y),
+            (f"среднее по осям |ΔX| {np.nanmean(np.abs(ax_hist[0])):4.2f}  |ΔY| {np.nanmean(np.abs(ax_hist[1])):4.2f}  "
+             f"|ΔZ| {np.nanmean(np.abs(ax_hist[2])):4.2f}" if ax_hist[0] else "", f_small, Y),
+            (f"Заявленная неопределённость: 95 % в ~{ref_r:4.1f} м, курс ±{np.degrees(est.heading_std):4.1f}°" if ok
+             else "", f_small, G),
+            (f"Обновлений: {fps:4.1f} /с   детектор {det_ms:3.0f} мс   трекер {tick_ms:4.1f} мс", f_small, W),
+            (f"Детекции: {det_name}; трекер видит только прошлое", f_small, D),
+            ("Синий — модель, жёлтый — точка CSV и след, белый крест — эталон", f_small, D),
+        ]
+        if np.all(np.isfinite(d)):
+            for i in range(3):
+                ax_hist[i].append(d[i])
+        cols = [col1, col2, col3]
         for ci, col_lines in enumerate(cols):
             px, py = 18 + ci * 640, 732
             for text, fnt, col in col_lines:

@@ -1,0 +1,46 @@
+{
+  "scheduler": {
+    "enabled": false
+  },
+  "triangulation": {
+    "mode": "none"
+  },
+  "spline": {
+    "enabled": false
+  },
+  "tracker": {
+    "heading_rate_limit_dps": 1000000000.0,
+    "occlusion_hold_frames": 0,
+    "occlusion_size_ratio": 0.8,
+    "heading_output_rate_limit": true,
+    "heading_accel_limit_dps2": 120.0
+  },
+  "orientation": {
+    "enabled": true
+  },
+  "uncertainty": {
+    "heading_sigma_floor_deg": 5.0,
+    "heading_turn_lag_s": 1.0,
+    "clip_covariance": true,
+    "no_stereo_q_growth_per_s": 0.5,
+    "depth_sigma_growth_mps": 1.0,
+    "model_sigma_px": 5.0,
+    "model_length_sigma_m": 0.6
+  },
+  "homography": {
+    "enabled": true
+  },
+  "road": {
+    "mode": "online",
+    "constraint": true
+  },
+  "confirmation": {
+    "init_min_ray_angle_deg": 10.0,
+    "init_max_reproj_px": 40.0,
+    "handoff_gate_chi2": 13.8
+  },
+  "silhouette": {
+    "enabled": true,
+    "mode": "heading"
+  }
+}

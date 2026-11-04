@@ -83,7 +83,8 @@ class CamerasConfig:
 class StreamingConfig:
     mode: str = "replay"                       # live | replay (видео в реальном темпе) | detections (готовые детекции)
     realtime_pacing: bool = True               # replay: выдавать кадры с исходной частотой (иначе — как можно быстрее)
-    queue_size: int = 2                        # кадров в очереди на камеру; старые вытесняются
+    queue_size: int = 8                        # кадров в очереди на камеру; старые вытесняются (запас для
+                                               # выбора кадров одной метки у всех камер, см. Synchronizer)
     sync_tolerance_ms: float = 20.0            # кадры разных камер считаются одновременными в этом допуске
     max_frame_age_ms: float = 150.0            # кадр старше — устаревший, пропускается
     decode_on_demand: bool = True              # вытесняющие очереди: retrieve только нужных кадров
@@ -160,6 +161,10 @@ class TrackerConfig:
     init_frames: int = 8
     mono_init: bool = False                    # старт по одной камере (грубо, quality = mono); см. visibility.py
     use_edges: bool = True                     # измерение по рёбрам рамки проекции модели
+    heading_output_rate_limit: bool = False    # физический предел поворота для итогового курса (v / R_min)
+    min_turn_radius_m: float = 8.0
+    heading_accel_limit_dps2: float = 0.0      # предел углового ускорения итогового курса, °/с² (0 — выкл.)
+    occlusion_size_ratio: float = 0.0          # рамка уже проекции модели в столько раз — край срезан (0 — выкл.)
     occlusion_hold_frames: int = 3             # гистерезис закрытых рёбер: удержание решения, кадров (0 — выкл.)
     occlusion_ramp_frames: int = 8             # затем плавный возврат веса ребра за столько кадров
     truck_fbx: str = "models/CargoTruck.fbx"
@@ -264,6 +269,18 @@ class UncertaintyConfig:
 
 
 @dataclass
+class SilhouetteConfig:
+    enabled: bool = False                      # подгонка модели к контуру масок ≥2 камер (silhouette_fit.py)
+    mode: str = "measure"                      # measure | heading | output (см. reconstruction/visibility.py)
+    min_views: int = 2
+    area_ratio_min: float = 0.7                # маска частично закрыта, если площадь не согласуется с моделью
+    prior_sigma_m: float = 0.5
+    prior_sigma_heading_deg: float = 5.0
+    inflation: float = 2.0
+    gate_chi2: float = 13.8
+
+
+@dataclass
 class StreamConfig:
     cameras: CamerasConfig = field(default_factory=CamerasConfig)
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -279,6 +296,7 @@ class StreamConfig:
     mono_depth: MonoDepthConfig = field(default_factory=MonoDepthConfig)
     confirmation: ConfirmationConfig = field(default_factory=ConfirmationConfig)
     uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
+    silhouette: SilhouetteConfig = field(default_factory=SilhouetteConfig)
 
     @classmethod
     def load(cls, path: Path | str | None = None, overrides: list[str] | None = None) -> "StreamConfig":

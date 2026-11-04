@@ -72,6 +72,13 @@ VARIANTS["ALL"] = ("A + все доработки", {**_A, **{k: v for _, o in U
 # немного ухудшает — избыточна при рёбрах рамки той же камеры; см. docs/UPGRADE_REPORT.md)
 VARIANTS["REC"] = ("A + рекомендуемые доработки (O, H, R, V, U; без M)",
                    {**_A, **{k: v for key, (_, o) in UPGRADE_COMPONENTS.items() if key != "M" for k, v in o.items()}})
+VARIANTS["REC+S"] = ("REC + курс по подгонке модели к контуру масок ≥2 камер (silhouette_fit)",
+                     {**VARIANTS["REC"][1], "silhouette.enabled": True, "silhouette.mode": "heading"})
+VARIANTS["BEST"] = ("REC+S + отсев рамок, срезанных перекрытием (по размеру против модели)",
+                    {**VARIANTS["REC+S"][1], "tracker.occlusion_size_ratio": 0.8})
+VARIANTS["BEST+smooth"] = ("BEST + физические пределы поворота итогового курса (v / R_min и 120°/с²)",
+                           {**VARIANTS["BEST"][1], "tracker.heading_output_rate_limit": True,
+                            "tracker.heading_accel_limit_dps2": 120.0})
 SMOOTHED_VARIANTS = {"D", "E"}
 SEGMENTS = {"одна камера 200–300": (200, 300), "медленный поворот 650–850": (650, 850)}
 
@@ -286,10 +293,11 @@ def run_variants(base: StreamConfig, data_dir: Path, det_dir: Path, out_dir: Pat
     for key in keys:
         cfg = variant_config(base, key)
         started = time.time()
-        if cfg.orientation.enabled and polygons is None:
+        need_masks = cfg.orientation.enabled or cfg.silhouette.enabled
+        if need_masks and polygons is None:
             polygons = load_polygons(det_dir, base.cameras.ids)
         pipe = StreamPipeline(cfg, data_dir, out_dir / f"variant_{key}", detections, n, model=model,
-                              source_delays=source_delays, polygons=polygons if cfg.orientation.enabled else None)
+                              source_delays=source_delays, polygons=polygons if need_masks else None)
         records = pipe.run()
         dims = pipe.dims.as_array()
         m = evaluate_records(records, truth, c.units_per_meter, c.fps, model, dims, key in SMOOTHED_VARIANTS, test_ranges)

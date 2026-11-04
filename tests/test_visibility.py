@@ -354,3 +354,52 @@ def test_diverged_track_reinitializes_from_stereo():
     err = np.array(err)
     assert err[61] > 3000                                   # сразу после сбоя трек далеко
     assert np.nanmedian(err[100:]) < 100                    # после переинициализации — снова точен
+
+
+def test_camera_seen_on_every_tick_is_not_reappearing_when_ticks_skip_frames():
+    """Тики через 3 кадра (реальный темп): камера, видимая на каждом тике, не «появляется» заново."""
+    data, points = synthetic()
+    tracker = CabTracker(TrackerSettings(), DIMS)
+    by_frame = {}
+    for i, t in enumerate(data.times.astype(int)):
+        by_frame.setdefault(t, []).append(i)
+    for f in range(0, 60, 3):
+        dets = [(int(data.camera_indices[i]), data.edges[i], data.edge_valid[i], 1.0,
+                 points.get((int(data.camera_indices[i]), f)), True) for i in by_frame[f]]
+        tracker.step(f, {d[0]: provider(d[0], f) for d in dets}, dets, dt_frames=3.0)
+    assert all(v == 0 for v in tracker._appeared.values())
+
+
+def test_size_cut_edge_is_detected_even_when_prediction_lags():
+    """Рамка вдвое уже модели: срезано ребро, отклонившееся сильнее (отставание прогноза сдвигает оба ребра)."""
+    tracker = CabTracker(TrackerSettings(occlusion_size_ratio=0.8), DIMS)
+    predicted = np.array([[100.0, 400.0, 200.0, 300.0]])
+    lag = 30.0                                            # прогноз отстаёт: обе стороны сдвинуты на 30 px
+    observed = np.array([[100.0 + lag + 150.0, 400.0 + lag, 200.0, 300.0]])   # левая часть закрыта
+    cut = tracker._size_cut_edges(predicted, observed, np.ones((1, 4), bool))
+    assert cut.tolist() == [[True, False, False, False]]
+    whole = np.array([[100.0 + lag, 400.0 + lag, 200.0, 300.0]])
+    assert not tracker._size_cut_edges(predicted, whole, np.ones((1, 4), bool)).any()
+
+
+def test_output_heading_respects_turn_rate_and_yaw_acceleration_limits():
+    """Итоговый курс не дёргается: шаг ≤ (v/R_min + пол)·dt и изменение скорости поворота ≤ предела."""
+    data, points = synthetic()
+    s = TrackerSettings(heading_output_rate_limit=True, heading_accel_limit_dps2=120.0, min_turn_radius_m=8.0)
+    tracker = CabTracker(s, DIMS)
+    by_frame = {}
+    for i, t in enumerate(data.times.astype(int)):
+        by_frame.setdefault(t, []).append(i)
+    headings = []
+    for f in FRAMES:
+        dets = [(int(data.camera_indices[i]), data.edges[i], data.edge_valid[i], 1.0,
+                 points.get((int(data.camera_indices[i]), int(f))), True) for i in by_frame.get(int(f), [])]
+        e = tracker.step(int(f), {d[0]: provider(d[0], int(f)) for d in dets}, dets)
+        if np.isfinite(e.heading):
+            if headings and np.random.default_rng(int(f)).random() < 0.3:
+                tracker.heading += math.radians(10)            # имитация рывка поправки курса
+            headings.append(e.heading)
+    step = np.abs(np.diff(np.unwrap(headings)))
+    max_rate = (SPEED * 30 / 100) / 8.0 + math.radians(5.0)    # рад/с
+    assert step.max() <= max_rate / 30 + 1e-9
+    assert np.abs(np.diff(np.diff(np.unwrap(headings)))).max() <= math.radians(120.0) / 30 ** 2 * 2 + 1e-6
