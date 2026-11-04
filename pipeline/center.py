@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from detection.schema import Detection
+from pipeline.detect import detector_info
 from reconstruction.bspline import fit_initial_bspline
 from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera
 from reconstruction.triangulation import triangulate_robust
@@ -131,6 +132,8 @@ def debiased_norm(along, cross, vertical, mask) -> tuple[np.ndarray, dict]:
 
 def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
     out: Path = args.out
+    # Детекции лежат в каталоге основного прогона; при отдельном запуске — рядом с отчётом
+    info = getattr(args, "detector_info", None) or detector_info(out)
     plots = out / "plots"
     plots.mkdir(parents=True, exist_ok=True)
     upm = args.units_per_meter
@@ -263,7 +266,8 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
 
     gaps = [(int(a), int(b)) for a, b in find_gaps(ok) if b - a + 1 >= 3]
     metrics = {
-        "WARNING": "Модель дообучена на этих же видео: точность детекции оценена на обучающих данных.",
+        "WARNING": info["warning"],
+        "detector": info["source"],
         "weights": str(args.weights),
         "frame_offset": offset,
         "frame_offset_best_by_scan": best_offset,
@@ -305,7 +309,8 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
                n_inliers=n_inliers, span=span, spline_points=spline_points, spl_err=spl_err,
                along=along, cross=cross, vertical=vertical, comp_eval=comp_eval, speed=speed,
                gt_speed=gt_speed, per_camera=per_camera, offset_scan=offset_scan, offset=offset,
-               detections=detections, cameras=cameras, upm=upm, tri=tri)
+               detections=detections, cameras=cameras, upm=upm, tri=tri,
+               detector_note=info["note"])
     make_plots(plots, ctx)
     write_report(out, metrics)
     log.info("готово: %s", out / "report.md")
@@ -334,7 +339,7 @@ def _style():
 def make_plots(plots: Path, c: dict) -> None:
     plt = _style()
     upm, frames = c["upm"], c["frames"]
-    note = "YOLO (дообучена на этих же видео)"
+    note = c["detector_note"]
 
     # 1. Вид сверху
     fig, ax = plt.subplots(figsize=(11, 6.5))
@@ -484,11 +489,11 @@ def write_report(out: Path, m: dict) -> None:
     cov = m["coverage"]
     k = m["kinematics"]
     lines = [
-        "# Проверка точности на YOLO",
+        "# Проверка точности детекций",
         "",
         f"> ⚠️ {m['WARNING']}",
         "",
-        f"Веса: `{m['weights']}`. Смещение кадров: {m['frame_offset']} "
+        f"Детекции: {m['detector']}. Смещение кадров: {m['frame_offset']} "
         f"(по скану без постоянного смещения лучшее: {m['frame_offset_best_by_scan']}).",
         "",
         "Испорченные ячейки CSV цели (исключены из оценки): " + ("; ".join(m["target_csv_issues"]) or "нет"),
