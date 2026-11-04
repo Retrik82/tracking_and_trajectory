@@ -610,18 +610,28 @@ class CabTracker:
         # Окно и требуемое число точек адаптируются к фактическому шагу измерений; при полном
         # темпе (шаг ≤ 2 кадра) поведение в точности прежнее. Линейность на окне ~2 с терпима:
         # инициализация лишь сеет фильтр (СКО позиции 4 м), дальше правят обычные обновления.
-        gaps = np.diff([f for f, _ in self._init_buffer]) if len(self._init_buffer) >= 2 else []
-        spacing = float(np.median(gaps)) if len(gaps) else 1.0
+        def cadence(buf):
+            gaps = np.diff([f for f, _ in buf]) if len(buf) >= 2 else []
+            return float(np.median(gaps)) if len(gaps) else 1.0
+
+        spacing = cadence(self._init_buffer)
         if spacing <= 2.0:
             window, needed = 3 * self.s.init_frames, self.s.init_frames
         else:
             window, needed = int(np.ceil(2.0 * self.s.fps)), max(4, self.s.init_frames // 2)
+        # моно-буфер: тот же принцип — при полном темпе прежние 2·init_frames точек,
+        # при редких тиках порог и окно, достижимые при фактическом шаге измерений
+        mono_spacing = cadence(self._mono_buffer)
+        if mono_spacing <= 2.0:
+            mono_window, mono_needed = window, 2 * self.s.init_frames
+        else:
+            mono_window, mono_needed = int(np.ceil(2.0 * self.s.fps)), max(4, self.s.init_frames // 2)
         self._init_buffer = [(f, p) for f, p in self._init_buffer if frame - f < window]
-        self._mono_buffer = [(f, p) for f, p in self._mono_buffer if frame - f < window]
+        self._mono_buffer = [(f, p) for f, p in self._mono_buffer if frame - f < mono_window]
         mono = False
         buffer = self._init_buffer
         if len(buffer) < needed:
-            if not allow_mono or self._init_buffer or len(self._mono_buffer) < 2 * self.s.init_frames:
+            if not allow_mono or self._init_buffer or len(self._mono_buffer) < mono_needed:
                 return False
             buffer, mono = self._mono_buffer, True
         frames = np.array([f for f, _ in buffer], dtype=float)

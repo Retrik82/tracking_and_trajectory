@@ -676,6 +676,7 @@ class StreamPipeline:
         self.out_dir = Path(out_dir or cfg.output.out_dir)
         self.detections = detections
         self.num_frames = num_frames
+        self._autodetect_resolution()
         self.model = model if model is not None else load_truck_model(cfg)
         self.tracker, self.scheduler, self.spline, self.dims = build_components(cfg, self.model)
         self.pose_provider = pose_provider or self._pose_from_csv
@@ -692,6 +693,28 @@ class StreamPipeline:
         self._prev_t = None
         self._last_run: dict[int, int] = {}      # камера -> тик последнего запуска детектора (бюджет)
         self._last_found: dict[int, int] = {}    # камера -> тик последней найденной детекции
+
+    def _autodetect_resolution(self) -> None:
+        """
+        Разрешение кадра — из свойств видеофайла первой доступной камеры (replay/live по файлам),
+        а не из конфигурации: от него считаются фокусные расстояния в пикселях, границы кадра
+        для планировщика и рёбер, размер видеозаписи. Расхождение с конфигом — предупреждение.
+        """
+        c, s = self.cfg.cameras, self.cfg.streaming
+        if s.mode == "detections":
+            return
+        for cam in c.ids:
+            path = self.data_dir / c.video_pattern.format(cam=cam)
+            if not path.is_file():
+                continue
+            from reconstruction.data_io import _video_resolution
+
+            width, height = _video_resolution(str(path))
+            if (width, height) != (c.width, c.height):
+                log.warning("разрешение видео %d×%d (из %s) отличается от конфигурации %d×%d — "
+                            "использую разрешение файла", width, height, path.name, c.width, c.height)
+                c.width, c.height = width, height
+            return
 
     EXPLORE_EVERY = 5                            # каждый N-й тик один слот бюджета — разведка
 

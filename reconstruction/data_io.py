@@ -21,7 +21,36 @@ def camera_csv_path(data_dir: Path, cam_id: int) -> Path:
 
 
 def video_path(data_dir: Path, cam_id: int) -> Path:
+    """Видео камеры: любой префикс сцены (Way1, Way2, …); нет файла — имя сцены 1 (для сообщений)."""
+    matches = sorted(Path(data_dir).glob(f"*.FinalImage.CineCameraActor{cam_id}.mp4"))
+    if matches:
+        return matches[0]
     return Path(data_dir) / f"Way1.FinalImage.CineCameraActor{cam_id}.mp4"
+
+
+def video_resolution(data_dir: Path, cam_id: int) -> tuple[int, int]:
+    """
+    Разрешение видео камеры (ширина, высота) из свойств самого файла — оно и используется
+    в расчёте фокусных расстояний в пикселях. Видео нет (режим detections) — значения по
+    умолчанию IMAGE_WIDTH × IMAGE_HEIGHT.
+    """
+    return _video_resolution(str(video_path(data_dir, cam_id)))
+
+
+@lru_cache(maxsize=None)
+def _video_resolution(path: str) -> tuple[int, int]:
+    if Path(path).is_file():
+        import cv2
+
+        cap = cv2.VideoCapture(path)
+        try:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        finally:
+            cap.release()
+        if width > 0 and height > 0:
+            return width, height
+    return IMAGE_WIDTH, IMAGE_HEIGHT
 
 
 def target_csv_path(data_dir: Path) -> Path:
@@ -29,30 +58,47 @@ def target_csv_path(data_dir: Path) -> Path:
 
 
 def read_focal_length_mm(csv_path: Path) -> float:
-    """Фокус записан в строке заголовка: «...;;;Focal length;35»."""
+    """
+    Фокус камеры, мм. Два формата CSV:
+      сцена 1: пара в заголовке «...;;;Focal length;35»;
+      сцена 2: колонка Focal_Length_mm — значение из первой строки данных
+               (по кадрам он постоянен; если бы менялся, нужна поддержка в Camera).
+    """
     return _read_focal_length_mm(str(csv_path))
 
 
 @lru_cache(maxsize=None)
 def _read_focal_length_mm(csv_path: str) -> float:
     with open(csv_path, encoding=CSV_ENCODING, newline="") as f:
-        header = next(csv.reader(f, delimiter=";"))
-    for name, value in zip(header, header[1:]):
-        if name.strip().lower() == "focal length":
-            return float(value.replace(",", "."))
-    raise ValueError(f"В заголовке {csv_path} нет фокусного расстояния")
+        reader = csv.reader(f, delimiter=";")
+        header = next(reader)
+        for name, value in zip(header, header[1:]):
+            if name.strip().lower() == "focal length":
+                return float(value.replace(",", "."))
+        normalized = [h.strip().lower().replace(" ", "_") for h in header]
+        for col, name in enumerate(normalized):
+            if name.startswith("focal_length"):
+                for row in reader:
+                    if row and len(row) > col and row[col].strip():
+                        return float(row[col].strip().replace(",", "."))
+    raise ValueError(f"В {csv_path} нет фокусного расстояния (ни в заголовке, ни колонкой)")
 
 
 def make_camera(data_dir: Path, cam_id: int, csv_frame: int) -> Camera:
-    """Камера с позой из строки CSV с номером csv_frame и фокусом из заголовка."""
+    """
+    Камера с позой из строки CSV с номером csv_frame и фокусом из CSV. Разрешение берётся
+    из свойств видеофайла этой камеры (фокусные расстояния в пикселях считаются от него);
+    без видео — значения по умолчанию 1920 × 1080.
+    """
     path = camera_csv_path(data_dir, cam_id)
     focal = read_focal_length_mm(path)
+    width, height = video_resolution(data_dir, cam_id)
     return Camera.from_csv_frame(
         path, csv_frame,
-        f_x=focal / SENSOR_WIDTH_MM * IMAGE_WIDTH,
-        f_y=focal / SENSOR_HEIGHT_MM * IMAGE_HEIGHT,
-        c_x=IMAGE_WIDTH / 2, c_y=IMAGE_HEIGHT / 2,
-        width=IMAGE_WIDTH, height=IMAGE_HEIGHT,
+        f_x=focal / SENSOR_WIDTH_MM * width,
+        f_y=focal / SENSOR_HEIGHT_MM * height,
+        c_x=width / 2, c_y=height / 2,
+        width=width, height=height,
     )
 
 
