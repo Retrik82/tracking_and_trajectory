@@ -32,11 +32,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pipeline.config import StreamConfig                       # noqa: E402
 from pipeline.streaming import build_components, load_detections_table, load_polygons, load_truck_model  # noqa: E402
 from pipeline.variants import VARIANTS                           # noqa: E402
-from reconstruction.data_io import load_target, make_camera     # noqa: E402
+from reconstruction.data_io import (  # noqa: E402
+    VideoResolutionError, find_video, load_target, make_camera, probe_video_resolution,
+)
 from reconstruction.fusion import silhouette_points             # noqa: E402
 
 TILE = (640, 360)
-SCALE = TILE[0] / 1920
 FONT_PATHS = ["/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf",
               "/System/Library/Fonts/Helvetica.ttc", "C:/Windows/Fonts/arial.ttf",
               "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
@@ -234,8 +235,13 @@ class Precomputed:
         return dets, {c: self.polys.get((c, idx)) for c in dets}
 
 
+def tile_scale(cam) -> np.ndarray:
+    """Пиксели кадра камеры -> пиксели плитки (кадр уменьшается до TILE; разрешение у камер своё)."""
+    return np.array([TILE[0] / cam.width, TILE[1] / cam.height])
+
+
 def project(cam, pts):
-    uv = cam.project(np.atleast_2d(pts)) * SCALE
+    uv = cam.project(np.atleast_2d(pts)) * tile_scale(cam)
     return uv
 
 
@@ -265,9 +271,22 @@ def main(argv=None):
         cfg = StreamConfig.load(Path(args.config))
         name = "REC (курс по силуэту, дорога, неопределённость)"
     cams_ids = cfg.cameras.ids
+    global TILE
+    if len(cams_ids) > 5:                    # до 9 камер: сетка 3×3 плиток 426×240 в левой части 1280×720
+        TILE = (426, 240)
+        slots = [(x * 426, y * 240) for y in range(3) for x in range(3)]
+    else:
+        slots = [(0, 0), (640, 0), (1280, 0), (0, 360), (640, 360)]
     model = load_truck_model(cfg)
     tracker, _, _, dims = build_components(cfg, model)
-    paths = {c: args.data / cfg.cameras.video_pattern.format(cam=c) for c in cams_ids}
+    paths = {c: find_video(args.data, c, cfg.cameras.video_pattern) for c in cams_ids}
+    missing = [c for c, path in paths.items() if path is None]
+    if missing:
+        raise SystemExit(f"нет видео камер {missing} ({cfg.cameras.video_pattern}) в {args.data}")
+    try:                                         # разрешение каждого видео — для K и масштаба плиток
+        sizes = {c: probe_video_resolution(paths[c]) for c in cams_ids}
+    except VideoResolutionError as e:
+        raise SystemExit(str(e)) from None
     n = int(cv2.VideoCapture(str(paths[cams_ids[0]])).get(cv2.CAP_PROP_FRAME_COUNT))
     if args.detections is not None:
         detector, source, live = Precomputed(args.detections, cams_ids), FileSource(paths), False
@@ -287,7 +306,7 @@ def main(argv=None):
     source.start()
 
     # рамка карты — все камеры и траектория (эталон только задаёт рамку картинки); сверху место под подпись
-    pts = [make_camera(args.data, c, 0).position[:2] for c in cams_ids]
+    pts = [make_camera(args.data, c, 0, sizes[c]).position[:2] for c in cams_ids]
     if target is not None:
         pts += list(target.positions[target.valid][:, :2])
     pts = np.array(pts)
@@ -312,8 +331,8 @@ def main(argv=None):
         args.save.parent.mkdir(parents=True, exist_ok=True)
         writer = cv2.VideoWriter(str(args.save), cv2.VideoWriter_fourcc(*"mp4v"), cfg.cameras.fps, (1920, 960))
     if not args.no_window:
-        cv2.namedWindow("Peleng: 5 камер, реальное время", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Peleng: 5 камер, реальное время", 1440, 720)
+        cv2.namedWindow("Peleng: камеры, реальное время", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Peleng: камеры, реальное время", 1440, 720)
     period = 1.0 / (cfg.cameras.fps * args.speed)
     t_next = time.perf_counter()
     fps_hist = deque(maxlen=30)
@@ -327,7 +346,7 @@ def main(argv=None):
             break
         f, full = got
         frames = {c: cv2.resize(img, TILE, interpolation=cv2.INTER_AREA) for c, img in full.items()}
-        cams = {c: make_camera(args.data, c, f + cfg.cameras.frame_offset) for c in cams_ids}
+        cams = {c: make_camera(args.data, c, f + cfg.cameras.frame_offset, sizes[c]) for c in cams_ids}
         t_d = time.perf_counter()
         dets, cur_polys = detector.detect(f, full)
         det_ms = (time.perf_counter() - t_d) * 1000
@@ -336,7 +355,7 @@ def main(argv=None):
             d = dets.get(c)
             if d is None:
                 continue
-            valid = np.array([d.x1 > m, d.x2 < cfg.cameras.width - m, d.y1 > m, d.y2 < cfg.cameras.height - m])
+            valid = np.array([d.x1 > m, d.x2 < cams[c].width - m, d.y1 > m, d.y2 < cams[c].height - m])
             tuples.append((c, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence, (d.point_u, d.point_v),
                            not d.unreliable, cur_polys.get(c) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None))
         dt_frames = 1.0 if prev_f is None else float(f - prev_f)
@@ -354,18 +373,18 @@ def main(argv=None):
         sil = silhouette_points(est.box_center, tracker.heading_dir, model, dims.as_array()) if ok else None
 
         canvas = np.zeros((960, 1920, 3), np.uint8)
-        slots = [(0, 0), (640, 0), (1280, 0), (0, 360), (640, 360)]
         for (x0, y0), c in zip(slots, cams_ids):
             img = frames[c].copy()
             cam = cams[c]
             if c in dets:
                 d = dets[c]
                 poly = cur_polys.get(c)
+                sx, sy = tile_scale(cam)
                 if poly is not None:
-                    cv2.polylines(img, [(poly * SCALE).astype(np.int32)], True, (90, 220, 90), 1, cv2.LINE_AA)
+                    cv2.polylines(img, [(poly * (sx, sy)).astype(np.int32)], True, (90, 220, 90), 1, cv2.LINE_AA)
                 rejected = c in est.rejected_cameras
                 col = (60, 60, 230) if rejected else (200, 200, 200)
-                cv2.rectangle(img, (int(d.x1 * SCALE), int(d.y1 * SCALE)), (int(d.x2 * SCALE), int(d.y2 * SCALE)),
+                cv2.rectangle(img, (int(d.x1 * sx), int(d.y1 * sy)), (int(d.x2 * sx), int(d.y2 * sy)),
                               col, 1, cv2.LINE_AA)
             if ok:
                 uv = project(cam, sil)
@@ -387,8 +406,8 @@ def main(argv=None):
                 q = project(cam, gt)[0]
                 if np.all(np.isfinite(q)) and 0 <= q[0] < TILE[0] and 0 <= q[1] < TILE[1]:
                     cv2.drawMarker(img, tuple(q.astype(int)), (255, 255, 255), cv2.MARKER_CROSS, 14, 2)
-            canvas[y0:y0 + 360, x0:x0 + 640] = img
-            cv2.rectangle(canvas, (x0, y0), (x0 + 639, y0 + 359), (40, 40, 40), 1)
+            canvas[y0:y0 + TILE[1], x0:x0 + TILE[0]] = img
+            cv2.rectangle(canvas, (x0, y0), (x0 + TILE[0] - 1, y0 + TILE[1] - 1), (40, 40, 40), 1)
 
         # вид сверху
         mp = canvas[360:720, 1280:1920]
@@ -483,7 +502,7 @@ def main(argv=None):
         if writer is not None:
             writer.write(canvas)
         if not args.no_window:
-            cv2.imshow("Peleng: 5 камер, реальное время", canvas)
+            cv2.imshow("Peleng: камеры, реальное время", canvas)
             if live:
                 key = cv2.waitKey(1) & 0xFF
             else:

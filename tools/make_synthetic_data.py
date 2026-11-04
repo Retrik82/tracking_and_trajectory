@@ -40,8 +40,12 @@ from detection.schema import Detection                       # noqa: E402
 from reconstruction.cab_model import DEFAULT_DIMENSIONS, box_corners  # noqa: E402
 from reconstruction.camera import Camera                     # noqa: E402
 from reconstruction.data_io import (                         # noqa: E402
-    IMAGE_HEIGHT, IMAGE_WIDTH, SENSOR_HEIGHT_MM, SENSOR_WIDTH_MM, camera_csv_path, target_csv_path,
+    camera_csv_path, target_csv_path, write_detections_image_sizes,
 )
+
+# Разрешение синтетических камер: генератор сам задаёт «видео», поэтому знает его размер и записывает
+# в meta.json детекций (по нему пайплайн строит внутренние параметры без видеофайлов)
+IMAGE_WIDTH, IMAGE_HEIGHT = 1920, 1080
 
 NUM_FRAMES = 1001            # кадров видео
 CSV_ROWS = 1002              # строк в CSV (как в реальных данных)
@@ -143,9 +147,7 @@ def look_at(position, target, focal_mm):
     d = np.asarray(target, float) - np.asarray(position, float)
     pitch = math.atan2(d[2], math.hypot(d[0], d[1]))
     yaw = math.atan2(d[1], d[0])
-    return Camera(position, 0.0, pitch, yaw,
-                  focal_mm / SENSOR_WIDTH_MM * IMAGE_WIDTH, focal_mm / SENSOR_HEIGHT_MM * IMAGE_HEIGHT,
-                  IMAGE_WIDTH / 2, IMAGE_HEIGHT / 2, IMAGE_WIDTH, IMAGE_HEIGHT)
+    return Camera.from_physical(position, 0.0, pitch, yaw, focal_mm, IMAGE_WIDTH, IMAGE_HEIGHT)
 
 
 def camera_poses(pos: np.ndarray) -> dict[int, list[Camera]]:
@@ -283,7 +285,9 @@ def generate(data_dir: Path, out_dir: Path, sc: Scenario, seed: int = 0) -> dict
         np.savez_compressed(det_dir / f"cam{cam}_polygons.npz")
     (det_dir / "meta.json").write_text(json.dumps({"weights": "synthetic", "scenario": sc.name,
                                                    "source_delays": sc.source_delays,
-                                                   "note": "синтетика, без YOLO"}, ensure_ascii=False, indent=2))
+                                                   "note": "синтетика, без YOLO"}, ensure_ascii=False, indent=2),
+                                       encoding="utf-8")
+    write_detections_image_sizes(det_dir, {cam: (IMAGE_WIDTH, IMAGE_HEIGHT) for cam in cams})
     speed = np.linalg.norm(vel, axis=1) * FPS / 100
     return {"scenario": sc.name, "speed_min": float(speed.min()), "speed_max": float(speed.max()),
             "detections": {c: len(d) for c, d in rows.items()}, "source_delays": sc.source_delays}

@@ -115,7 +115,7 @@ def render(sc: Scenario, seed: int = 0):
                 continue
             x1, x2 = uv[:, 0].min(), uv[:, 0].max()
             y1, y2 = uv[:, 1].min(), uv[:, 1].max()
-            if x2 < 0 or x1 > 1920 or y2 < 0 or y1 > 1080:
+            if x2 < 0 or x1 > cam.width or y2 < 0 or y1 > cam.height:
                 continue
             poly_src = uv
             if sc.mask_heading_error_deg is not None:

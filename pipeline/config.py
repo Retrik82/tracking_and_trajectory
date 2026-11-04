@@ -6,7 +6,7 @@
 печатает полный JSON, который можно сохранить и править.
 
 Разделы:
-  cameras      номера камер, размер кадра, сенсор, FPS, пути к файлам
+  cameras      номера камер, FPS, пути к файлам (разрешение — из каждого видео, матрица — константа)
   streaming    режим (live / replay / detections), очереди, синхронизация, устаревшие кадры
   detector     веса YOLO, imgsz, устройство, пороги, пакетная обработка
   scheduler    адаптивный выбор камер (ACTIVE / PROBE / SLEEP)
@@ -26,12 +26,43 @@
 """
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
+
+from reconstruction.camera import SENSOR_HEIGHT_MM, SENSOR_WIDTH_MM
+
+log = logging.getLogger("peleng")
+
+SENSOR_SIZE_MM = (SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM)     # постоянная матрица камеры, мм
+
+
+def _legacy_camera_key(section: str, key: str, value) -> bool:
+    """
+    Прежние параметры cameras.width / height / sensor_*_mm (есть в старых config_used.json).
+    Разрешение теперь берётся из каждого видео — width/height игнорируются с предупреждением.
+    Размер матрицы постоянный: совпадающее значение игнорируется, другое — ошибка.
+    True — ключ обработан и пропущен.
+    """
+    if section != "cameras":
+        return False
+    if key in ("width", "height"):
+        log.warning("параметр cameras.%s=%s игнорируется: разрешение кадра определяется отдельно по каждому "
+                    "видео", key, value)
+        return True
+    if key in ("sensor_width_mm", "sensor_height_mm"):
+        expected = SENSOR_SIZE_MM[0 if key == "sensor_width_mm" else 1]
+        if abs(float(value) - expected) > 1e-9:
+            raise ValueError(f"cameras.{key}={value}: физический размер матрицы постоянный — "
+                             f"{SENSOR_SIZE_MM[0]} × {SENSOR_SIZE_MM[1]} мм, менять его нельзя")
+        return True
+    return False
 
 
 def _set_nested(obj, dotted: str, value: str) -> None:
     section, _, key = dotted.partition(".")
+    if key and _legacy_camera_key(section, key, value):
+        return
     if not key or not hasattr(obj, section):
         raise ValueError(f"Неизвестный параметр {dotted!r}")
     target = getattr(obj, section)
@@ -65,15 +96,13 @@ def _set_nested(obj, dotted: str, value: str) -> None:
 
 @dataclass
 class CamerasConfig:
+    # Разрешения кадра и размера матрицы здесь нет: разрешение определяется отдельно для каждого видео
+    # (reconstruction/data_io.py), матрица 23.76 × 13.365 мм постоянна (reconstruction/camera.py).
     ids: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 5])
-    width: int = 1920
-    height: int = 1080
-    sensor_width_mm: float = 23.76
-    sensor_height_mm: float = 13.365
     fps: float = 30.0
     units_per_meter: float = 100.0
     frame_offset: int = 0                      # кадр CSV = кадр видео + смещение
-    video_pattern: str = "Way1.FinalImage.CineCameraActor{cam}.mp4"
+    video_pattern: str = "*.FinalImage.CineCameraActor{cam}.mp4"   # любая сцена (Way1, Way2, …)
     pose_pattern: str = "object_transform_CineCameraActor{cam}.csv"
     target_csv: str = "object_transform_SM_AA_track.csv"   # только для оценки
     live_sources: dict = field(default_factory=dict)        # {"1": "rtsp://...", ...} для режима live
@@ -309,6 +338,8 @@ class StreamConfig:
                     continue
                 target = getattr(cfg, section_field.name)
                 for key, value in section.items():
+                    if _legacy_camera_key(section_field.name, key, value):
+                        continue
                     if not hasattr(target, key):
                         raise ValueError(f"Неизвестный параметр {section_field.name}.{key}")
                     setattr(target, key, value)

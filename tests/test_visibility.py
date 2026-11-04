@@ -92,10 +92,24 @@ def test_detect_occluded_edges_one_sided_shrink_only():
     observed[2, 1] -= 80                        # сжалась с обеих сторон — это не препятствие
     observed[3, 3] -= 70                        # низ закрыт (рельеф)
     valid = np.ones((4, 4), bool)
-    occluded = detect_occluded_edges(predicted, observed, valid, s)
+    sizes = np.array([[1920, 1080]] * 4)
+    occluded = detect_occluded_edges(predicted, observed, valid, s, sizes)
     assert occluded.tolist() == [[False, True, False, False], [False] * 4, [False] * 4, [False, False, False, True]]
     valid[0, 1] = False                         # обрезано краем кадра — уже учтено, не «закрытие»
-    assert not detect_occluded_edges(predicted, observed, valid, s)[0].any()
+    assert not detect_occluded_edges(predicted, observed, valid, s, sizes)[0].any()
+
+
+def test_detect_occluded_edges_uses_frame_size_of_each_camera():
+    """Прогнозное ребро у края кадра — обрезка, а не препятствие; край у каждой камеры свой."""
+    s = TrackerSettings()
+    predicted = np.array([[500.0, 900.0, 300.0, 500.0]] * 2)
+    observed = predicted.copy()
+    observed[:, 1] -= 120                       # правое ребро ушло внутрь прогноза
+    valid = np.ones((2, 4), bool)
+    # камера 0 — 1920×1080: прогнозное ребро x=900 в кадре -> закрыто;
+    # камера 1 — 896×504: x=900 уже за краем кадра -> это обрезка краем, не закрытие
+    occluded = detect_occluded_edges(predicted, observed, valid, s, np.array([[1920, 1080], [896, 504]]))
+    assert occluded[0, 1] and not occluded[1, 1]
 
 
 # ---------------------------------------------------------------- сопровождение

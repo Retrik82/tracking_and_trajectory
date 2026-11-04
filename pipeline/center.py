@@ -16,7 +16,8 @@ import numpy as np
 
 from detection.schema import Detection
 from reconstruction.bspline import fit_initial_bspline
-from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera
+from reconstruction.camera import FrameNotFoundError
+from reconstruction.data_io import load_target, make_camera
 from reconstruction.triangulation import triangulate_robust
 
 CAMERAS = [1, 2, 3, 4, 5]        # список меняется на месте (set_cameras), чтобы все модули видели один объект
@@ -45,17 +46,20 @@ CAMERA_COLORS = {1: BLUE, 2: ORANGE, 3: AQUA, 4: YELLOW, 5: MAGENTA}
 # ---------------------------------------------------------------- геометрия
 
 class CameraCache:
-    def __init__(self, data_dir: Path):
+    """Камеры по (номер, кадр CSV); image_sizes — фактическое разрешение видео каждой камеры."""
+
+    def __init__(self, data_dir: Path, image_sizes: dict[int, tuple[int, int]] | None = None):
         self.data_dir = data_dir
+        self.image_sizes = image_sizes or {}
         self._cache = {}
 
     def get(self, cam: int, csv_frame: int):
         key = (cam, csv_frame)
         if key not in self._cache:
             try:
-                self._cache[key] = make_camera(self.data_dir, cam, csv_frame)
-            except ValueError:
-                self._cache[key] = None
+                self._cache[key] = make_camera(self.data_dir, cam, csv_frame, self.image_sizes.get(cam))
+            except FrameNotFoundError:
+                self._cache[key] = None          # в CSV нет корректной строки на этот кадр
         return self._cache[key]
 
 
@@ -151,7 +155,7 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
     target = load_target(args.data)
     for issue in target.issues:
         log.warning("CSV цели: испорченная ячейка: %s — кадр исключён из оценки", issue)
-    cameras = CameraCache(args.data)
+    cameras = CameraCache(args.data, getattr(args, "image_sizes", None))
 
     # Сплайн по самой цели (в кадрах CSV) — только для направления движения при оценке
     gt_spline = fit_initial_bspline(target.frames[target.valid].astype(float), target.positions[target.valid],
@@ -199,7 +203,7 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
         for f in frames:
             c = cameras.get(cam, f + offset)
             uv = c.project(gt[f]) if gt_valid[f] and c is not None else np.array([np.nan, np.nan])
-            visible = bool(np.all(np.isfinite(uv)) and 0 <= uv[0] < IMAGE_WIDTH and 0 <= uv[1] < IMAGE_HEIGHT)
+            visible = bool(np.all(np.isfinite(uv)) and 0 <= uv[0] < c.width and 0 <= uv[1] < c.height)
             in_view.append(visible)
             d = detections[cam].get(f)
             if d is None:

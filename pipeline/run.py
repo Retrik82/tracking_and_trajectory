@@ -36,7 +36,8 @@ from pipeline.center import (
     _style, debiased_norm, find_gaps, run_evaluation, set_cameras, stats, truck_frame_components,
 )
 from pipeline.coverage import plot_camera_coverage
-from pipeline.detect import detector_info, load_detections, run_detection
+from pipeline.detect import detections_dir, detector_info, load_detections, run_detection
+from pipeline.export import tracker_rows, write_trajectory_csv
 from reconstruction.approximation import causal_polynomial, global_polynomial
 from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
 from reconstruction.cab_model import (
@@ -51,7 +52,7 @@ from reconstruction.cab_model import (
     offset_point_trajectory,
     truck_axes,
 )
-from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera, video_path
+from reconstruction.data_io import VideoResolutionError, load_target, make_camera, resolve_image_sizes, video_path
 from reconstruction.objective import ObjectiveData
 from reconstruction.optimizer import optimize_trajectory
 from reconstruction.truck_model import SCENE_SCALE, TruckModel
@@ -147,7 +148,8 @@ def setup_logging(out: Path) -> None:
 
 
 def camera_provider(args):
-    return lambda cam, frame: make_camera(args.data, cam, frame)
+    """Камера (номер, кадр CSV) с разрешением её видео (args.image_sizes, см. run)."""
+    return lambda cam, frame: make_camera(args.data, cam, frame, args.image_sizes[cam])
 
 
 # ---------------------------------------------------------------- шаги
@@ -190,7 +192,7 @@ def step_optimize(args, detections, center: BSplineTrajectory) -> BSplineTraject
 def step_cab(args, detections, center: BSplineTrajectory) -> dict:
     observations = BoxObservations.from_detections(
         [d for cam in detections.values() for d in cam.values()],
-        width=IMAGE_WIDTH, height=IMAGE_HEIGHT, frame_offset=args.frame_offset,
+        args.image_sizes, frame_offset=args.frame_offset,
     )
     dims = TruckDimensions(args.truck_length, args.truck_width, args.truck_height)
     initial = initial_cab_trajectory(center, dims, knot_spacing=args.cab_knot_spacing)
@@ -219,8 +221,7 @@ def step_cab(args, detections, center: BSplineTrajectory) -> dict:
 def step_realtime(args, detections) -> dict:
     """Трекер реального времени: кадры по порядку, на каждом — только прошлое и текущий кадр."""
     rows = [d for cam in detections.values() for d in cam.values()]
-    observations = BoxObservations.from_detections(rows, width=IMAGE_WIDTH, height=IMAGE_HEIGHT,
-                                                    frame_offset=args.frame_offset)
+    observations = BoxObservations.from_detections(rows, args.image_sizes, frame_offset=args.frame_offset)
     points = {(d.camera, d.frame): (d.point_u, d.point_v) for d in rows}
     reliable = {(d.camera, d.frame): not d.unreliable for d in rows}
     settings = TrackerSettings(fps=args.fps, units_per_meter=args.units_per_meter,
@@ -235,10 +236,11 @@ def step_realtime(args, detections) -> dict:
     else:
         log.warning("трекер: 3D-модели %s нет, используется коробка %s", args.truck_fbx, dims)
     cache: dict = {}
+    make = camera_provider(args)
 
     def provider(cam, frame):
         if (cam, frame) not in cache:
-            cache[(cam, frame)] = make_camera(args.data, cam, frame)
+            cache[(cam, frame)] = make(cam, frame)
         return cache[(cam, frame)]
 
     started = time.time()
@@ -254,6 +256,12 @@ def step_realtime(args, detections) -> dict:
              cameras=result.array("cameras"), cameras_used=result.array("cameras_used"),
              occluded_edges=result.array("occluded_edges"),
              frames_since_measurement=result.array("frames_since_measurement"))
+    cams_by_frame: dict = {}
+    for d in rows:
+        cams_by_frame.setdefault(d.frame, []).append(d.camera)
+    n = write_trajectory_csv(args.out / "trajectory.csv", tracker_rows(result, np.arange(NUM_VIDEO_FRAMES), args.fps,
+                                                                       args.units_per_meter, cams_by_frame))
+    log.info("координаты трекера: %s (%d кадров, центр кабины, м)", args.out / "trajectory.csv", n)
     return {"result": result, "dimensions": dims, "model": model, "ms_per_frame": elapsed / NUM_VIDEO_FRAMES * 1000}
 
 
@@ -815,15 +823,21 @@ def render_videos(args, detections, c: dict) -> None:
             continue
         cap = cv2.VideoCapture(str(video_path(args.data, cam)))
         target_file = out_dir / f"realtime_cam{cam}.mp4"
+        size = args.image_sizes[cam]                     # разрешение этого видео (см. run)
         ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{IMAGE_WIDTH}x{IMAGE_HEIGHT}",
+            ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{size[0]}x{size[1]}",
              "-r", str(args.fps), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
              "-pix_fmt", "yuv420p", str(target_file)], stdin=subprocess.PIPE)
         for f in range(NUM_VIDEO_FRAMES):
             ok, img = cap.read()
             if not ok:
                 break
-            camera = make_camera(args.data, cam, f + args.frame_offset)
+            if (img.shape[1], img.shape[0]) != size:
+                # кадр не того размера: приводим к размеру видео — K камеры построена для него
+                log.warning("видео cam%d, кадр %d: %d×%d вместо %d×%d — кадр масштабирован", cam, f,
+                            img.shape[1], img.shape[0], *size)
+                img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+            camera = make_camera(args.data, cam, f + args.frame_offset, size)
             d = detections[cam].get(f)
             if d is not None:
                 cv2.rectangle(img, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), bgr(MUTED), 1, cv2.LINE_AA)
@@ -871,7 +885,7 @@ def render_videos(args, detections, c: dict) -> None:
             legend = [("truck model (tracker)" if model is not None else "truck box (tracker)", BLUE), ("cab center + past trail", YELLOW), ("detector box", MUTED),
                       ("target CSV", AQUA)]
             for i, (text, col) in enumerate(legend):
-                y = IMAGE_HEIGHT - 20 - 26 * (len(legend) - 1 - i)
+                y = img.shape[0] - 20 - 26 * (len(legend) - 1 - i)
                 cv2.rectangle(img, (16, y - 12), (32, y + 2), bgr(col), -1)
                 cv2.putText(img, text, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
             ffmpeg.stdin.write(img.tobytes())
@@ -901,6 +915,13 @@ def run(args) -> None:
     if "detect" in steps:
         run_detection(args)
     detections = load_detections(args.out)
+    # Разрешение кадра — отдельно для каждой камеры: из её видео, без видео — из meta.json детекций
+    try:
+        args.image_sizes = resolve_image_sizes(args.data, CAMERAS, detections_dir(args.out))
+    except VideoResolutionError as e:
+        raise SystemExit(f"Разрешение видео: {e}") from None
+    log.info("разрешение кадра по камерам: %s",
+             ", ".join(f"cam{cam} {w}×{h}" for cam, (w, h) in sorted(args.image_sizes.items())))
 
     needs_center = any(s in steps for s in ("center", "optimize", "cab", "compare", "video"))
     center_result = step_center(args, detections) if needs_center else None
@@ -918,7 +939,7 @@ def run(args) -> None:
     elif (args.out / "cab_spline.npz").exists() and any(s in steps for s in ("compare", "video")):
         data = np.load(args.out / "cab_spline.npz")
         observations = BoxObservations.from_detections([d for cam in detections.values() for d in cam.values()],
-                                                       frame_offset=args.frame_offset)
+                                                       args.image_sizes, frame_offset=args.frame_offset)
         trajectory = load_spline(args.out / "cab_spline.npz")
         cab = {"trajectory": trajectory, "dimensions": TruckDimensions(*data["dimensions"]),
                "center_trajectory": offset_point_trajectory(trajectory, args.cab_center_back, args.cab_center_up),

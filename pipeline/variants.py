@@ -28,7 +28,7 @@ from pipeline.config import StreamConfig
 from pipeline.streaming import StreamPipeline, load_detections_table, load_polygons, load_truck_model
 from reconstruction.bspline import fit_initial_bspline
 from reconstruction.cab_model import truck_axes
-from reconstruction.data_io import load_target
+from reconstruction.data_io import detections_image_sizes, load_target
 
 log = logging.getLogger("peleng.variants")
 
@@ -284,6 +284,7 @@ def run_variants(base: StreamConfig, data_dir: Path, det_dir: Path, out_dir: Pat
                  num_frames: int | None = None, test_ranges=None, source_delays=None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     detections, n = load_detections_table(det_dir, base.cameras.ids)
+    image_sizes = detections_image_sizes(det_dir)          # разрешение видео, на котором сделаны детекции
     n = num_frames or n
     c = base.cameras
     truth = ground_truth(data_dir, n, c.fps, c.units_per_meter, c.frame_offset)
@@ -297,7 +298,8 @@ def run_variants(base: StreamConfig, data_dir: Path, det_dir: Path, out_dir: Pat
         if need_masks and polygons is None:
             polygons = load_polygons(det_dir, base.cameras.ids)
         pipe = StreamPipeline(cfg, data_dir, out_dir / f"variant_{key}", detections, n, model=model,
-                              source_delays=source_delays, polygons=polygons if need_masks else None)
+                              source_delays=source_delays, polygons=polygons if need_masks else None,
+                              image_sizes=image_sizes)
         records = pipe.run()
         dims = pipe.dims.as_array()
         m = evaluate_records(records, truth, c.units_per_meter, c.fps, model, dims, key in SMOOTHED_VARIANTS, test_ranges)

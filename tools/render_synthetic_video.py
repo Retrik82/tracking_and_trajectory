@@ -20,8 +20,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from reconstruction.cab_model import DEFAULT_DIMENSIONS, box_corners          # noqa: E402
-from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, video_path     # noqa: E402
-from tools.make_synthetic_data import FPS, NUM_FRAMES, SCENARIOS, camera_poses, trajectory  # noqa: E402
+from tools.make_synthetic_data import (  # noqa: E402 — разрешение синтетических камер задаёт генератор
+    FPS, IMAGE_HEIGHT, IMAGE_WIDTH, NUM_FRAMES, SCENARIOS, camera_poses, trajectory,
+)
 
 # грани коробки по индексам углов _CORNERS (x: 0 перед/1 зад, y: ±, z: 0 низ/1 верх) -> индекс = 4x + 2y + z
 FACES = {
@@ -91,7 +92,7 @@ def main(argv=None) -> None:
     args.data.mkdir(parents=True, exist_ok=True)
     img = np.zeros((IMAGE_HEIGHT, IMAGE_WIDTH, 3), np.uint8)
     for cam_id in (int(c) for c in args.cameras.split(",")):
-        out = video_path(args.data, cam_id)
+        out = args.data / f"Way1.FinalImage.CineCameraActor{cam_id}.mp4"
         ff = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
                                "-s", f"{IMAGE_WIDTH}x{IMAGE_HEIGHT}", "-r", str(FPS), "-i", "-", "-c:v", "libx264",
                                "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p", str(out)], stdin=subprocess.PIPE)

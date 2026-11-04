@@ -170,9 +170,16 @@ def test_rotating_camera_provider(true_spline):
 def test_from_detections_and_initial_guess(true_spline):
     d = Detection(camera=2, frame=10, confidence=0.9, x1=0.0, y1=100.0, x2=500.0, y2=1080.0,
                   point_u=250.0, point_v=500.0, point_source="mask_centroid")
-    obs = BoxObservations.from_detections([d], frame_offset=1)
+    obs = BoxObservations.from_detections([d], {2: (1920, 1080)}, frame_offset=1)
     assert obs.frames[0] == 11 and obs.times[0] == 10
     assert obs.edge_valid[0].tolist() == [False, True, True, False]
+    # та же рамка в кадре 1280×720: правое ребро x=500 в кадре, низ y=1080 — за краем
+    small = BoxObservations.from_detections([d], {2: (1280, 720)})
+    assert small.edge_valid[0].tolist() == [False, True, True, False]
+    wide = BoxObservations.from_detections([d], {2: (3840, 2160)})
+    assert wide.edge_valid[0].tolist() == [False, True, True, True]    # y2=1080 внутри кадра высотой 2160
+    with pytest.raises(ValueError, match="нет разрешения"):
+        BoxObservations.from_detections([d], {1: (1920, 1080)})
 
     center = BSplineTrajectory(true_spline.knots, true_spline.control_points, 3, 0, 120)
     init = initial_cab_trajectory(center, DIMS, knot_spacing=20)

@@ -4,7 +4,8 @@
 Результат в <out>/detections/:
   cam{N}.csv            одна строка на кадр, где есть грузовик (формат — detection.schema.Detection)
   cam{N}_polygons.npz   контур маски выбранного объекта по кадрам (ключ — номер кадра)
-  meta.json             веса, imgsz, порог уверенности, устройство, классы модели
+  meta.json             веса, imgsz, порог уверенности, устройство, классы модели; image_size —
+                        разрешение видео каждой камеры, на котором сделаны детекции (для шагов без видео)
 
 Повторный запуск пропускает камеры, для которых CSV уже есть (--redetect — пересчитать).
 """
@@ -20,13 +21,34 @@ import numpy as np
 
 from detection.schema import Detection
 from pipeline.center import CAMERAS
-from reconstruction.data_io import video_path
+from reconstruction.data_io import (VideoResolutionError, detections_image_sizes, find_video,
+                                    probe_video_resolution, video_path, write_detections_image_sizes)
 
 log = logging.getLogger("peleng")
 
 
 def detections_dir(out: Path) -> Path:
     return out / "detections"
+
+
+def _video_size(args, cam: int) -> tuple[int, int]:
+    """Разрешение видео камеры перед детекцией; не определить — понятная ошибка, а не детекция «вслепую»."""
+    try:
+        return probe_video_resolution(video_path(args.data, cam))
+    except VideoResolutionError as e:
+        raise SystemExit(f"cam{cam}: {e}") from None
+
+
+def _record_image_sizes(args, out: Path, previous: dict[int, tuple[int, int]]) -> None:
+    """
+    Разрешение видео по камерам — в meta.json: шаги без видео (center, cab, realtime, stream detections)
+    строят внутренние параметры камер по нему. Камера без видео сохраняет прежнее значение.
+    """
+    sizes = dict(previous)
+    for cam in CAMERAS:
+        if find_video(args.data, cam) is not None:
+            sizes[cam] = _video_size(args, cam)
+    write_detections_image_sizes(out, sizes)
 
 
 def run_detection(args) -> None:
@@ -49,11 +71,13 @@ def run_detection(args) -> None:
 
     out = detections_dir(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    previous_sizes = detections_image_sizes(out)
     for cam in CAMERAS:
         csv_path = out / f"cam{cam}.csv"
         if csv_path.exists() and not args.redetect:
             log.info("cam%d: детекции уже есть (%s), пропускаю; --redetect чтобы пересчитать", cam, csv_path)
             continue
+        log.info("cam%d: %s, разрешение %d×%d", cam, video_path(args.data, cam).name, *_video_size(args, cam))
         started = time.time()
         rows, polygons = [], {}
         for res in detector.detect_video(video_path(args.data, cam), cam):
@@ -74,7 +98,8 @@ def run_detection(args) -> None:
     (out / "meta.json").write_text(json.dumps({
         "weights": str(args.weights), "imgsz": args.imgsz, "conf": args.conf,
         "device": detector.device, "backend": detector.backend, "classes": detector.model.names,
-    }, ensure_ascii=False, indent=2))
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    _record_image_sizes(args, out, previous_sizes)
 
 
 def _save_camera(out: Path, cam: int, results) -> int:
@@ -98,7 +123,7 @@ def camera_rotations(data_dir: Path, cam: int, frame_offset: int = 0) -> tuple[n
     from reconstruction.camera import load_camera_poses
     from reconstruction.data_io import camera_csv_path, make_camera
 
-    camera = make_camera(data_dir, cam, frame_offset)
+    camera = make_camera(data_dir, cam, frame_offset)        # разрешение — из видео этой камеры
     poses = load_camera_poses(str(camera_csv_path(data_dir, cam)))
     angles = {f: p[1:] for f, p in poses.items()}
     if len({tuple(a) for a in angles.values()}) <= 1:
@@ -121,10 +146,12 @@ def run_classic_detection(args) -> None:
     detector = ClassicDetector(settings)
     out = detections_dir(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    previous_sizes = detections_image_sizes(out)
     for cam in CAMERAS:
         if (out / f"cam{cam}.csv").exists() and not args.redetect:
             log.info("cam%d: детекции уже есть, пропускаю; --redetect чтобы пересчитать", cam)
             continue
+        log.info("cam%d: %s, разрешение %d×%d", cam, video_path(args.data, cam).name, *_video_size(args, cam))
         started = time.time()
         K, rotations = camera_rotations(args.data, cam, args.frame_offset)
         n = _save_camera(out, cam, detector.detect_video(video_path(args.data, cam), cam, rotations, K))
@@ -133,13 +160,14 @@ def run_classic_detection(args) -> None:
     (out / "meta.json").write_text(json.dumps({
         "detector": "classic (вычитание фона, detection/classic.py)",
         "settings": {k: v for k, v in vars(settings).items()},
-    }, ensure_ascii=False, indent=2, default=list))
+    }, ensure_ascii=False, indent=2, default=list), encoding="utf-8")
+    _record_image_sizes(args, out, previous_sizes)
 
 
 def detector_info(out: Path) -> dict:
     """Чем получены детекции (из meta.json): для подписей в отчётах и видео."""
     try:
-        meta = json.loads((detections_dir(out) / "meta.json").read_text())
+        meta = json.loads((detections_dir(out) / "meta.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         meta = {}
     if str(meta.get("detector", "")).startswith("classic"):

@@ -38,9 +38,10 @@ import numpy as np
 from detection.schema import Detection
 from pipeline.config import StreamConfig, describe
 from reconstruction.cab_model import TruckDimensions, truck_axes
-from reconstruction.camera import Camera
+from reconstruction.camera import Camera, FrameNotFoundError, read_camera_csv
 from reconstruction.camera_scheduler import ACTIVE, CameraScheduler, SchedulerSettings, TrackSnapshot
-from reconstruction.data_io import make_camera
+from reconstruction.data_io import (VideoResolutionError, camera_csv_path, detections_image_sizes, find_video,
+                                    frame_resolution, make_camera, probe_video_resolution)
 from reconstruction.fusion import FusionSettings
 from reconstruction.streaming_bspline import StreamingBSpline, StreamingSplineSettings
 from reconstruction.truck_model import TruckModel
@@ -618,7 +619,7 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
         max_longitudinal_mps2=t.max_longitudinal_mps2, max_lateral_mps2=t.max_lateral_mps2,
         max_correction_per_frame=t.max_correction_per_frame_m * c.units_per_meter,
         heading_rate_limit_dps=t.heading_rate_limit_dps, min_heading_speed_mps=t.heading_min_speed_mps,
-        init_frames=t.init_frames, mono_init=t.mono_init, image_width=c.width, image_height=c.height,
+        init_frames=t.init_frames, mono_init=t.mono_init,
         edge_inflation_with_point=cfg.triangulation.edge_inflation_with_point,
         **upgrade_settings(cfg),
     )
@@ -643,7 +644,7 @@ def build_components(cfg: StreamConfig, model: TruckModel | None):
         probe_period_frames=sc.probe_period_frames, sleep_period_frames=sc.sleep_period_frames,
         min_active=sc.min_active, max_active=sc.max_active, occluded_patience_frames=sc.occluded_patience_frames,
         force_std_m=sc.force_std_m, force_nis=sc.force_nis, force_reproj_px=sc.force_reproj_px,
-        border_px=sc.border_px, prefer_geometry=sc.prefer_geometry, image_width=c.width, image_height=c.height,
+        border_px=sc.border_px, prefer_geometry=sc.prefer_geometry,
         units_per_meter=c.units_per_meter), c.ids, model, dims.as_array())
     sp = cfg.spline
     spline = StreamingBSpline(StreamingSplineSettings(
@@ -669,8 +670,15 @@ class StreamPipeline:
     def __init__(self, cfg: StreamConfig, data_dir: Path, out_dir: Path | None = None,
                  detections: dict[int, dict[int, Detection]] | None = None, num_frames: int | None = None,
                  model: TruckModel | None = None, pose_provider=None, visualizer=None, detector=None,
-                 source_delays: dict[int, int] | None = None, polygons: dict | None = None):
+                 source_delays: dict[int, int] | None = None, polygons: dict | None = None,
+                 image_sizes: dict[int, tuple[int, int]] | None = None):
         self.cfg = cfg
+        # Разрешение кадра по камерам, (ширина, высота): replay — из видеофайла камеры, live — по первому
+        # кадру потока, detections — из meta.json детекций (image_sizes) или видео, если оно есть.
+        # Обновляется по фактическому размеру каждого кадра (_observe_frame_size).
+        self.image_sizes: dict[int, tuple[int, int]] = {int(k): tuple(v) for k, v in (image_sizes or {}).items()}
+        self._expected_sizes = dict(self.image_sizes)   # из детекций: видео должно совпасть
+        self._camera_errors: dict[int, str] = {}
         self.polygons = polygons or {}
         self.data_dir = Path(data_dir)
         self.out_dir = Path(out_dir or cfg.output.out_dir)
@@ -709,19 +717,69 @@ class StreamPipeline:
                 chosen[-1] = rest[0]
         return chosen
 
-    # --- позы камер
+    # --- разрешение и позы камер
+    def _image_size(self, cam: int) -> tuple[int, int]:
+        """Фактическое разрешение кадра камеры; не известно — из её видеофайла; нет и его — ошибка."""
+        size = self.image_sizes.get(cam)
+        if size is None:
+            video = find_video(self.data_dir, cam, self.cfg.cameras.video_pattern)
+            if video is None:
+                raise VideoResolutionError(
+                    f"cam{cam}: разрешение кадра неизвестно — нет ни кадров, ни видео "
+                    f"{self.cfg.cameras.video_pattern.format(cam=cam)} в {self.data_dir}, ни image_size в meta.json "
+                    f"детекций; внутренние параметры камеры не вычислить")
+            size = self.image_sizes[cam] = probe_video_resolution(video)
+        return size
+
+    def _observe_frame_size(self, cam: int, image: np.ndarray) -> None:
+        """Размер пришедшего кадра — источник истины: K камеры строится для него (без двойного пересчёта)."""
+        size = frame_resolution(image, f"cam{cam}")
+        known = self.image_sizes.get(cam)
+        if known == size:
+            return
+        if known is None:
+            log.info("cam%d: разрешение %d×%d (по кадру потока)", cam, *size)
+        else:
+            log.warning("cam%d: размер кадра %d×%d отличается от ожидаемого %d×%d — внутренние параметры "
+                        "пересчитаны для фактического размера (физический фокус и матрица те же)", cam, *size, *known)
+        self.image_sizes[cam] = size
+
     def _pose_from_csv(self, cam: int, index: int) -> Camera:
-        key = (cam, index + self.cfg.cameras.frame_offset)
+        size = self._image_size(cam)
+        csv_frame = index + self.cfg.cameras.frame_offset
+        key = (cam, csv_frame, size)
         if key not in self._pose_cache:
             try:
-                self._pose_cache[key] = make_camera(self.data_dir, cam, key[1])
-            except ValueError:
+                self._pose_cache[key] = make_camera(self.data_dir, cam, csv_frame, size)
+            except FrameNotFoundError:
                 # live: нет строки на этот кадр — последняя известная поза (камеры 1–4 неподвижны)
-                last = max((k for k in self._pose_cache if k[0] == cam), default=None)
+                if not any(k[0] == cam for k in self._pose_cache):
+                    raise
+                poses = read_camera_csv(str(camera_csv_path(self.data_dir, cam))).poses
+                last = max((f for f in poses if f < csv_frame), default=None)
                 if last is None:
                     raise
-                self._pose_cache[key] = self._pose_cache[last]
+                self._pose_cache[key] = make_camera(self.data_dir, cam, last, size)
         return self._pose_cache[key]
+
+    def _camera_poses(self, bundle: "Bundle") -> dict[int, Camera]:
+        """
+        Позы камер тика. Камера, для которой параметры не вычислить (нет разрешения, нет позы в CSV,
+        кадр не соответствует матрице), исключается из тика с причиной; ошибка — в лог один раз.
+        """
+        poses = {}
+        for cam, f in list(bundle.frames.items()):
+            try:
+                if f.image is not None:
+                    self._observe_frame_size(cam, f.image)
+                poses[cam] = self.pose_provider(cam, bundle.index)
+            except (VideoResolutionError, ValueError) as e:
+                if self._camera_errors.get(cam) != type(e).__name__:      # в лог — первый случай каждого вида
+                    log.error("cam%d: камера исключена из расчёта: %s", cam, e)
+                    self._camera_errors[cam] = type(e).__name__
+                bundle.frames.pop(cam)
+                bundle.excluded[cam] = f"параметры камеры недоступны: {e}"
+        return poses
 
     # --- источники
     def _make_sources(self) -> None:
@@ -731,10 +789,33 @@ class StreamPipeline:
                 self.detector = PrecomputedDetector(self.detections, polygons=self.polygons)
             else:
                 self.detector = YoloAdapter(self.cfg.detector)
+        videos = {}
+        if s.mode == "replay":
+            # разрешение каждого видео — до старта: от него зависят f_x, f_y, края кадра, запись видео
+            for cam in c.ids:
+                path = find_video(self.data_dir, cam, c.video_pattern)
+                if path is None:
+                    log.warning("cam%d: нет видео %s в %s — камера пропущена", cam, c.video_pattern.format(cam=cam),
+                                self.data_dir)
+                    continue
+                try:
+                    size = probe_video_resolution(path)
+                except VideoResolutionError as e:
+                    log.error("cam%d: %s — камера пропущена", cam, e)
+                    continue
+                expected = self._expected_sizes.get(cam)
+                if expected is not None and expected != size:
+                    log.error("cam%d: видео %s %d×%d, а готовые детекции сделаны на кадрах %d×%d — камера пропущена",
+                              cam, path.name, *size, *expected)
+                    continue
+                log.info("cam%d: %s, разрешение %d×%d", cam, path.name, *size)
+                self.image_sizes[cam], videos[cam] = size, path
         # прогрев до назначения t0 и старта захвата: первый вызов (загрузка/компиляция модели)
-        # занимает секунды и не должен съедать реальное время потока и задерживать инициализацию
+        # занимает секунды и не должен съедать реальное время потока и задерживать инициализацию.
+        # Пустой кадр — размера настоящего видео; для live он ещё неизвестен — квадрат входа детектора.
         if hasattr(self.detector, "warmup"):
-            self.detector.warmup(c.height, c.width)
+            w, h = next(iter(self.image_sizes.values()), (self.cfg.detector.imgsz, self.cfg.detector.imgsz))
+            self.detector.warmup(h, w)
         t0 = time.perf_counter() + 0.2
         for cam in c.ids:
             if s.mode == "detections":
@@ -744,9 +825,8 @@ class StreamPipeline:
                                                     pacing=s.realtime_pacing, queue_size=s.queue_size,
                                                     delay_frames=self.source_delays.get(cam, 0))
             elif s.mode == "replay":
-                path = self.data_dir / c.video_pattern.format(cam=cam)
-                if not path.exists():
-                    log.warning("cam%d: нет видео %s — камера пропущена", cam, path)
+                path = videos.get(cam)
+                if path is None:
                     continue
                 self.sources[cam] = VideoSource(cam, str(path), c.fps, t0, s.realtime_pacing, s.queue_size,
                                                 live=False, max_frames=s.max_frames,
@@ -769,7 +849,7 @@ class StreamPipeline:
         c = cfg.cameras
         index, t = bundle.index, bundle.timestamp
         tick_start = time.perf_counter()
-        cams_pose = {cam: self.pose_provider(cam, index) for cam in bundle.frames}
+        cams_pose = self._camera_poses(bundle)
 
         # планировщик
         t_s = time.perf_counter()
@@ -797,7 +877,8 @@ class StreamPipeline:
         for cam, d in dets.items():
             if d is None:
                 continue
-            valid = np.array([d.x1 > m, d.x2 < c.width - m, d.y1 > m, d.y2 < c.height - m])
+            cam_obj = cams_pose[cam]                         # ребро у края кадра этой камеры — не измерение
+            valid = np.array([d.x1 > m, d.x2 < cam_obj.width - m, d.y1 > m, d.y2 < cam_obj.height - m])
             poly = getattr(self.detector, "polygons", {}).get((cam, d.frame)) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None
             tuples.append((cam, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence,
                            (d.point_u, d.point_v), not d.unreliable, poly))
@@ -949,6 +1030,10 @@ class StreamPipeline:
                 w.writerow(["frame", "x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az", "final", "fitted_at"])
                 for fr, smp in hist.items():
                     w.writerow([fr, *smp.position, *smp.velocity, *smp.acceleration, int(smp.final), smp.fitted_at])
+        if self.cfg.output.save_track_csv:
+            from pipeline.export import stream_rows, write_trajectory_csv
+
+            write_trajectory_csv(out / "trajectory.csv", stream_rows(self.records, self.cfg.cameras.units_per_meter))
         if self.cfg.output.performance_report:
             perf = self.performance()
             (out / "performance_report.json").write_text(json.dumps(perf, ensure_ascii=False, indent=2, default=float))
@@ -997,6 +1082,7 @@ class StreamVisualizer:
 
         self.cfg, self.out_dir, self.cameras, self.target = cfg, Path(out_dir), cameras, target
         self.writers: dict[int, subprocess.Popen] = {}
+        self.sizes: dict[int, tuple[int, int]] = {}
         self.trail_rt: deque = deque(maxlen=90)
         self.trail_sm: deque = deque(maxlen=90)
         self.fps_window: deque = deque(maxlen=30)
@@ -1008,14 +1094,21 @@ class StreamVisualizer:
         h = h.lstrip("#")
         return tuple(int(h[i:i + 2], 16) for i in (4, 2, 0))
 
-    def _writer(self, cam: int):
+    def _write(self, cam: int, img: np.ndarray) -> None:
+        """Кадр в видео камеры; размер видео — размер первого кадра этой камеры (у камер он свой)."""
+        import cv2
+
+        h, w = img.shape[:2]
         if cam not in self.writers:
             c = self.cfg.cameras
             self.writers[cam] = subprocess.Popen(
-                ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{c.width}x{c.height}",
+                ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
                  "-r", str(c.fps), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
                  str(self.out_dir / "videos" / f"stream_cam{cam}.mp4")], stdin=subprocess.PIPE)
-        return self.writers[cam]
+            self.sizes[cam] = (w, h)
+        if self.sizes[cam] != (w, h):                 # поток сменил разрешение: файл ffmpeg — прежнего размера
+            img = cv2.resize(img, self.sizes[cam], interpolation=cv2.INTER_AREA)
+        self.writers[cam].stdin.write(img.tobytes())
 
     def draw(self, bundle: Bundle, rec: TickRecord, est, plan, dets, cams_pose, pipeline: StreamPipeline) -> None:
         import cv2
@@ -1034,7 +1127,7 @@ class StreamVisualizer:
         upm = self.cfg.cameras.units_per_meter
         for cam in self.cameras:
             f = bundle.frames.get(cam)
-            if f is None or f.image is None:
+            if f is None or f.image is None or cam not in cams_pose:
                 continue
             img = f.image.copy()
             camera = cams_pose[cam]
@@ -1094,10 +1187,10 @@ class StreamVisualizer:
             legend = [("model (Kalman)", BLUE), ("cab center + trail (realtime)", YELLOW), ("smoothed B-spline", AQUA),
                       ("detector box / mask", MUTED), ("target CSV (eval only)", "#dc3c3c")]
             for i, (text, col) in enumerate(legend):
-                y = self.cfg.cameras.height - 20 - 26 * (len(legend) - 1 - i)
+                y = img.shape[0] - 20 - 26 * (len(legend) - 1 - i)
                 cv2.rectangle(img, (16, y - 12), (32, y + 2), self._bgr(col), -1)
                 cv2.putText(img, text, (40, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            self._writer(cam).stdin.write(img.tobytes())
+            self._write(cam, img)
 
     def close(self) -> None:
         for w in self.writers.values():
@@ -1186,13 +1279,15 @@ def main(argv=None) -> None:
         cfg.output.video = True
     if args.no_pacing:
         cfg.streaming.realtime_pacing = False
-    detections, num, detector, polygons = None, None, None, None
+    detections, num, detector, polygons, image_sizes = None, None, None, None, None
     if cfg.streaming.mode == "detections":
         det_dir = args.detections or (Path(cfg.output.out_dir) / "detections")
         detections, num = load_detections_table(det_dir, cfg.cameras.ids)
         polygons = load_polygons(det_dir, cfg.cameras.ids) if (cfg.orientation.enabled or cfg.silhouette.enabled) else None
         num = args.num_frames or num
+        image_sizes = detections_image_sizes(det_dir)        # разрешение видео, на котором сделаны детекции
     elif args.detections is not None:
+        image_sizes = detections_image_sizes(args.detections)
         table, _ = load_detections_table(args.detections, cfg.cameras.ids)
         detector = PrecomputedDetector(table, polygons=load_polygons(args.detections, cfg.cameras.ids)
                                        if (cfg.orientation.enabled or cfg.silhouette.enabled) else None)
@@ -1210,7 +1305,7 @@ def main(argv=None) -> None:
             pass
         visualizer = StreamVisualizer(cfg, Path(cfg.output.out_dir), cfg.output.video_cameras or cfg.cameras.ids, target)
     pipeline = StreamPipeline(cfg, args.data, Path(cfg.output.out_dir), detections, num, visualizer=visualizer,
-                              detector=detector, polygons=polygons)
+                              detector=detector, polygons=polygons, image_sizes=image_sizes)
     pipeline.run()
     perf = pipeline.performance()
     print(performance_markdown(perf))

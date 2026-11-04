@@ -68,9 +68,7 @@ class SchedulerSettings:
     force_reproj_px: float = 60.0
     border_px: float = 80.0
     prefer_geometry: bool = True
-    image_width: int = 1920
-    image_height: int = 1080
-    units_per_meter: float = 100.0
+    units_per_meter: float = 100.0         # размер кадра — у каждой камеры свой (Camera.width / height)
 
 
 @dataclass
@@ -143,7 +141,7 @@ def visibility_probability(camera: Camera, snapshot: TrackSnapshot, settings: Sc
         w, v = np.ones(3), np.eye(3)
     w = np.sqrt(np.maximum(w, 0.0)) * settings.sigma_scale
     samples = np.vstack([center] + [center + s * w[i] * v[:, i] for i in range(3) for s in (-1.0, 1.0)])   # (7, 3)
-    W, H, m, b = settings.image_width, settings.image_height, settings.margin_px, settings.border_px
+    W, H, m, b = camera.width, camera.height, settings.margin_px, settings.border_px      # кадр этой камеры
     pts = (samples[:, None, :] + offsets[None, :, :]).reshape(-1, 3)                                     # (7K, 3)
     uv = camera.project(pts)
     front = np.all(np.isfinite(uv), axis=1)

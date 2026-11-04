@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from pipeline.center import BLUE, CAMERA_COLORS, CAMERAS, INK_2, NUM_VIDEO_FRAMES, ORANGE, _style
-from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, make_camera
+from reconstruction.data_io import make_camera
 
 SEEN, SEEN_FLAGGED, OCCLUDED, OUT_OF_VIEW = 0, 1, 2, 3
 COVERAGE_LABELS = {
@@ -41,6 +41,11 @@ NEAR_TRUCK_M = 12.0        # конец луча — сам грузовик (21
 ANGLE_BIN_DEG = 0.5        # шаг по углу при рисовании света и тени сектора
 
 
+def _image_size(args, cam: int):
+    """Разрешение видео камеры (определено в pipeline/run.py); None — make_camera определит по видео."""
+    return (getattr(args, "image_sizes", None) or {}).get(cam)
+
+
 def camera_coverage(args, detections, gt: np.ndarray) -> dict[int, np.ndarray]:
     """
     Состояние каждой камеры на каждом кадре: найден / найден с флагом / загорожен / вне кадра.
@@ -55,8 +60,9 @@ def camera_coverage(args, detections, gt: np.ndarray) -> dict[int, np.ndarray]:
             if d is not None:
                 s[f] = SEEN_FLAGGED if d.unreliable else SEEN
             elif np.all(np.isfinite(gt[f])):
-                uv = make_camera(args.data, cam, f + args.frame_offset).project(gt[f])
-                if np.all(np.isfinite(uv)) and 0 <= uv[0] < IMAGE_WIDTH and 0 <= uv[1] < IMAGE_HEIGHT:
+                camera = make_camera(args.data, cam, f + args.frame_offset, _image_size(args, cam))
+                uv = camera.project(gt[f])
+                if np.all(np.isfinite(uv)) and 0 <= uv[0] < camera.width and 0 <= uv[1] < camera.height:
                     s[f] = OCCLUDED
         state[cam] = s
     return state
@@ -152,7 +158,8 @@ def plot_camera_coverage(out: Path, gt: np.ndarray, args, detections) -> dict[in
     truck = gt[:, :2] / upm
     state = camera_coverage(args, detections, gt)
     frames = np.arange(NUM_VIDEO_FRAMES)
-    cameras = {cam: [make_camera(args.data, cam, int(f) + args.frame_offset) for f in frames] for cam in CAMERAS}
+    cameras = {cam: [make_camera(args.data, cam, int(f) + args.frame_offset, _image_size(args, cam)) for f in frames]
+               for cam in CAMERAS}
     cam_xy = {cam: np.array([c.position[:2] / upm for c in cameras[cam]]) for cam in CAMERAS}
 
     every = np.vstack([truck[valid]] + [cam_xy[cam][:1] for cam in CAMERAS])

@@ -97,17 +97,28 @@ class BoxObservations:
             raise ValueError("Нет наблюдений")
 
     @classmethod
-    def from_detections(cls, detections, width: int = 1920, height: int = 1080, margin: float = 3.0,
+    def from_detections(cls, detections, image_sizes: dict[int, tuple[int, int]], margin: float = 3.0,
                         frame_offset: int = 0) -> "BoxObservations":
-        """Из объектов Detection (detection.schema). Время — кадр видео, поза — кадр CSV = кадр + смещение."""
+        """
+        Из объектов Detection (detection.schema). Время — кадр видео, поза — кадр CSV = кадр + смещение.
+        image_sizes — {камера: (ширина, высота)} фактического кадра её видео: ребро у края кадра своей
+        камеры — не измерение (у камер разрешение может различаться).
+        """
         detections = sorted(detections, key=lambda d: (d.frame, d.camera))
+        missing = sorted({d.camera for d in detections} - set(image_sizes))
+        if missing:
+            raise ValueError(f"нет разрешения кадра для камер {missing} — края рамок не проверить")
+
+        def valid(d):
+            width, height = image_sizes[d.camera]
+            return [d.x1 > margin, d.x2 < width - margin, d.y1 > margin, d.y2 < height - margin]
+
         return cls(
             times=[d.frame for d in detections],
             frames=[d.frame + frame_offset for d in detections],
             camera_indices=[d.camera for d in detections],
             edges=[[d.x1, d.x2, d.y1, d.y2] for d in detections],
-            edge_valid=[[d.x1 > margin, d.x2 < width - margin, d.y1 > margin, d.y2 < height - margin]
-                        for d in detections],
+            edge_valid=[valid(d) for d in detections],
             confidence=[d.confidence for d in detections],
         )
 

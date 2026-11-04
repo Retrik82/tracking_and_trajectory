@@ -101,9 +101,7 @@ class TrackerSettings:
     occlusion_hold_frames: int = 3
     occlusion_ramp_frames: int = 8
     reappear_min_weight: float = 0.2
-    image_width: int = 1920
-    image_height: int = 1080
-    edge_margin_px: float = 3.0
+    edge_margin_px: float = 3.0               # размер кадра — у каждой камеры свой (Camera.width / height)
     point_gate_nis: float = 16.0              # 3D-точка с NIS больше — выброс, не используется
     edge_inflation_with_point: float = 2.0    # рёбра камеры, вошедшей в точку, коррелированы с ней: R × k
     # Гейт детекций по согласованности с прогнозом (ложные рамки): рамка, у которой IoU с прогнозной
@@ -242,10 +240,11 @@ def _numeric_jacobian(fun, state: np.ndarray, steps: np.ndarray) -> np.ndarray:
 
 
 def detect_occluded_edges(predicted: np.ndarray, observed: np.ndarray, edge_valid: np.ndarray,
-                          settings: TrackerSettings) -> np.ndarray:
+                          settings: TrackerSettings, image_sizes: np.ndarray) -> np.ndarray:
     """
     Рёбра (M, 4) x1, x2, y1, y2, закрытые препятствием: ребро детектора ушло внутрь прогнозной
     рамки, противоположное совпадает, а прогнозное ребро в кадре (иначе это обрезка краем кадра).
+    image_sizes (M, 2) — ширина и высота кадра камеры каждой детекции (у камер они могут различаться).
     """
     predicted = np.asarray(predicted, dtype=float)
     observed = np.asarray(observed, dtype=float)
@@ -258,8 +257,9 @@ def detect_occluded_edges(predicted: np.ndarray, observed: np.ndarray, edge_vali
     opposite = np.abs(observed - predicted)[:, [1, 0, 3, 2]]
     opposite_ok = (opposite < settings.agree_px) & edge_valid[:, [1, 0, 3, 2]]
     m = settings.edge_margin_px
-    in_frame = np.c_[predicted[:, 0] > m, predicted[:, 1] < settings.image_width - m,
-                     predicted[:, 2] > m, predicted[:, 3] < settings.image_height - m]
+    sizes = np.asarray(image_sizes, dtype=float).reshape(-1, 2)
+    in_frame = np.c_[predicted[:, 0] > m, predicted[:, 1] < sizes[:, 0] - m,
+                     predicted[:, 2] > m, predicted[:, 3] < sizes[:, 1] - m]
     return edge_valid & in_frame & (inward > threshold) & opposite_ok
 
 
@@ -855,8 +855,7 @@ class CabTracker:
             self._measure(x[:3], direction, geometry)[0])
         J = _numeric_jacobian(f, self.state[:3].copy(), np.full(3, 1.0))
         cov = J @ P[:3, :3] @ J.T
-        s = self.s
-        inside = bool(box[1] > 0 and box[0] < s.image_width and box[3] > 0 and box[2] < s.image_height
+        inside = bool(box[1] > 0 and box[0] < camera.width and box[3] > 0 and box[2] < camera.height
                       and camera.depth(self.state[:3]) > 0)
         return {"visible": inside, "box": box, "center_px": center_px, "center_cov": cov,
                 "heading": float(self.heading), "heading_std": float(np.sqrt(self._heading_var_report))}
@@ -1095,8 +1094,9 @@ class CabTracker:
                 rejected[:] = False
             rejected_cameras = [int(c) for c, r in zip(cam_ids, rejected) if r]
             # закрытые рёбра с гистерезисом: решение удерживается и снимается плавно (вес 0 → 1)
+            sizes = np.array([[cameras[c].width, cameras[c].height] for c in cam_ids], dtype=float)
             edge_weight = self._occlusion_hysteresis(frame, detections, detect_occluded_edges(predicted, observed,
-                                                                                             valid, s))
+                                                                                             valid, s, sizes))
             edge_weight[rejected] = 0.0
             occluded = valid & (edge_weight < 1.0) & ~rejected[:, None]
             usable = valid & np.isfinite(predicted) & (edge_weight > 0) & ~rejected[:, None]
