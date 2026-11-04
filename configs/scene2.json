@@ -1,0 +1,10 @@
+{
+  "cameras": {"ids": [1, 2, 3, 4, 5, 6, 7, 8, 9]},
+  "scheduler": {"enabled": false},
+  "triangulation": {"mode": "none"},
+  "tracker": {
+    "box_length_m": 21.3,
+    "box_width_m": 5.35,
+    "box_height_m": 7.72
+  }
+}
