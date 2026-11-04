@@ -87,6 +87,8 @@ class StreamingConfig:
     sync_tolerance_ms: float = 20.0            # кадры разных камер считаются одновременными в этом допуске
     max_frame_age_ms: float = 150.0            # кадр старше — устаревший, пропускается
     detector_workers: int = 2                  # потоков детекции (при CPU-инференсе больше не помогает)
+    max_images_per_tick: int | None = None     # бюджет YOLO-изображений на тик (live/CPU): лишние активные
+                                               # камеры обходятся по кругу; None — без ограничения
     max_frames: int | None = None              # ограничить число тиков (отладка)
     log_every: int = 100                       # кадров между строками лога
 
@@ -97,7 +99,10 @@ class DetectorConfig:
     imgsz: int = 960
     conf: float = 0.25
     device: str | None = None                  # cuda / mps / cpu / None — автоматически
+    backend: str = "auto"                      # auto | torch | onnx | openvino (detection/yolo.py)
     half: bool = False                         # FP16 (только GPU)
+    retina_masks: bool = True                  # маски полного разрешения; False — центроид по полигону (дешевле)
+    threads: int | None = None                 # потоков torch/onnxruntime на инференс (None — по умолчанию)
     batch_active: bool = True                  # пакетная обработка активных камер одним вызовом
     min_mask_area_px: float = 400.0
     min_reliable_conf: float = 0.5
