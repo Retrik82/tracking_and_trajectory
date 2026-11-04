@@ -3,6 +3,7 @@
 import csv
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,11 @@ def target_csv_path(data_dir: Path) -> Path:
 
 def read_focal_length_mm(csv_path: Path) -> float:
     """Фокус записан в строке заголовка: «...;;;Focal length;35»."""
+    return _read_focal_length_mm(str(csv_path))
+
+
+@lru_cache(maxsize=None)
+def _read_focal_length_mm(csv_path: str) -> float:
     with open(csv_path, encoding=CSV_ENCODING, newline="") as f:
         header = next(csv.reader(f, delimiter=";"))
     for name, value in zip(header, header[1:]):

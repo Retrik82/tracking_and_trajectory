@@ -19,8 +19,16 @@ from reconstruction.bspline import fit_initial_bspline
 from reconstruction.data_io import IMAGE_HEIGHT, IMAGE_WIDTH, load_target, make_camera
 from reconstruction.triangulation import triangulate_robust
 
-CAMERAS = [1, 2, 3, 4, 5]
+CAMERAS = [1, 2, 3, 4, 5]        # список меняется на месте (set_cameras), чтобы все модули видели один объект
 NUM_VIDEO_FRAMES = 1001
+
+
+def set_cameras(ids) -> None:
+    """Задать номера камер (файлы object_transform_CineCameraActor{N}.csv и видео {N}); список общий для всех шагов."""
+    ids = sorted({int(i) for i in ids})
+    if not ids:
+        raise ValueError("Нужна хотя бы одна камера")
+    CAMERAS[:] = ids
 OFFSETS_TO_SCAN = range(-3, 4)
 log = logging.getLogger("peleng")
 
@@ -131,6 +139,12 @@ def debiased_norm(along, cross, vertical, mask) -> tuple[np.ndarray, dict]:
 
 def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
     out: Path = args.out
+    # Детекции лежат в каталоге основного прогона; при отдельном запуске — рядом с отчётом
+    info = getattr(args, "detector_info", None)
+    if info is None:
+        from pipeline.detect import detector_info   # здесь: detect импортирует CAMERAS из center
+
+        info = detector_info(out)
     plots = out / "plots"
     plots.mkdir(parents=True, exist_ok=True)
     upm = args.units_per_meter
@@ -184,7 +198,7 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
         flags = {"edge_clipped": 0, "too_small": 0, "unreliable": 0}
         for f in frames:
             c = cameras.get(cam, f + offset)
-            uv = c.project(gt[f]) if gt_valid[f] else np.array([np.nan, np.nan])
+            uv = c.project(gt[f]) if gt_valid[f] and c is not None else np.array([np.nan, np.nan])
             visible = bool(np.all(np.isfinite(uv)) and 0 <= uv[0] < IMAGE_WIDTH and 0 <= uv[1] < IMAGE_HEIGHT)
             in_view.append(visible)
             d = detections[cam].get(f)
@@ -257,13 +271,17 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
         for f, d in detections[cam].items():
             if not span[f] or d.unreliable:
                 continue
-            uv = cameras.get(cam, f + offset).project(spline_points[f])
+            c = cameras.get(cam, f + offset)
+            if c is None:
+                continue
+            uv = c.project(spline_points[f])
             errs.append(float(np.hypot(uv[0] - d.point_u, uv[1] - d.point_v)))
         spline_reproj[cam] = stats(errs)
 
     gaps = [(int(a), int(b)) for a, b in find_gaps(ok) if b - a + 1 >= 3]
     metrics = {
-        "WARNING": "Модель дообучена на этих же видео: точность детекции оценена на обучающих данных.",
+        "WARNING": info["warning"],
+        "detector": info["source"],
         "weights": str(args.weights),
         "frame_offset": offset,
         "frame_offset_best_by_scan": best_offset,
@@ -305,7 +323,8 @@ def run_evaluation(args, detections: dict[int, dict[int, Detection]]) -> dict:
                n_inliers=n_inliers, span=span, spline_points=spline_points, spl_err=spl_err,
                along=along, cross=cross, vertical=vertical, comp_eval=comp_eval, speed=speed,
                gt_speed=gt_speed, per_camera=per_camera, offset_scan=offset_scan, offset=offset,
-               detections=detections, cameras=cameras, upm=upm, tri=tri)
+               detections=detections, cameras=cameras, upm=upm, tri=tri,
+               detector_note=info["note"])
     make_plots(plots, ctx)
     write_report(out, metrics)
     log.info("готово: %s", out / "report.md")
@@ -334,7 +353,7 @@ def _style():
 def make_plots(plots: Path, c: dict) -> None:
     plt = _style()
     upm, frames = c["upm"], c["frames"]
-    note = "YOLO (дообучена на этих же видео)"
+    note = c["detector_note"]
 
     # 1. Вид сверху
     fig, ax = plt.subplots(figsize=(11, 6.5))
@@ -403,7 +422,8 @@ def make_plots(plots: Path, c: dict) -> None:
         for f, d in c["detections"][cam].items():
             if d.unreliable or not c["gt_valid"][f]:
                 continue
-            uv = c["cameras"].get(cam, f + c["offset"]).project(c["gt"][f])
+            cobj = c["cameras"].get(cam, f + c["offset"])
+            uv = cobj.project(c["gt"][f]) if cobj is not None else np.array([np.nan, np.nan])
             if np.all(np.isfinite(uv)):
                 e.append(np.hypot(d.point_u - uv[0], d.point_v - uv[1]))
         data.append(e)
@@ -484,11 +504,11 @@ def write_report(out: Path, m: dict) -> None:
     cov = m["coverage"]
     k = m["kinematics"]
     lines = [
-        "# Проверка точности на YOLO",
+        "# Проверка точности детекций",
         "",
         f"> ⚠️ {m['WARNING']}",
         "",
-        f"Веса: `{m['weights']}`. Смещение кадров: {m['frame_offset']} "
+        f"Детекции: {m['detector']}. Смещение кадров: {m['frame_offset']} "
         f"(по скану без постоянного смещения лучшее: {m['frame_offset_best_by_scan']}).",
         "",
         "Испорченные ячейки CSV цели (исключены из оценки): " + ("; ".join(m["target_csv_issues"]) or "нет"),

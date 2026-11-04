@@ -161,8 +161,12 @@ def plot_camera_coverage(out: Path, gt: np.ndarray, args, detections) -> dict[in
     grid = build_obstacle_map(cam_xy, truck, state, lo, hi)
 
     aspect = (hi[1] - lo[1]) / (hi[0] - lo[0])
-    fig, axes = plt.subplots(2, 3, figsize=(18, 2 * 6 * aspect + 2.4))
+    cols = 3
+    rows = int(np.ceil((len(CAMERAS) + 1) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(18, rows * 6 * aspect + 2.4), squeeze=False)
     axes = axes.ravel()
+    for ax in axes[len(CAMERAS) + 1:]:
+        ax.set_visible(False)
     extent = (grid.origin[0], grid.origin[0] + grid.free.shape[0] * grid.cell,
               grid.origin[1], grid.origin[1] + grid.free.shape[1] * grid.cell)
 

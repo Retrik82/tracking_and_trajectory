@@ -1,0 +1,294 @@
+"""
+Демонстрация трекера реального времени: окно с пятью камерами одновременно, вид сверху и параметры.
+
+Видео всех камер воспроизводятся синхронно в исходном темпе (30 FPS); на каждом кадре трекер получает
+детекции ТОЛЬКО этого кадра и выдаёт оценку (причинно, без будущих кадров). Детекции YOLO посчитаны
+заранее (outputs/main/detections): на этом компьютере YOLO на пяти камерах не успевает за 30 FPS.
+Эталон CSV рисуется только для сравнения (в трекер не подаётся), и только до текущего кадра.
+
+    .venv/bin/python tools/demo_live.py                                   # REC (configs/upgrade_recommended.json)
+    .venv/bin/python tools/demo_live.py --config none                     # базовый вариант A
+    .venv/bin/python tools/demo_live.py --save outputs/demo_live.mp4      # ещё и записать
+
+Клавиши: пробел — пауза / продолжить, q или Esc — выход.
+"""
+
+import argparse
+import queue
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from pipeline.config import StreamConfig                       # noqa: E402
+from pipeline.streaming import build_components, load_detections_table, load_polygons, load_truck_model  # noqa: E402
+from pipeline.variants import VARIANTS                           # noqa: E402
+from reconstruction.data_io import load_target, make_camera     # noqa: E402
+from reconstruction.fusion import silhouette_points             # noqa: E402
+
+TILE = (640, 360)
+SCALE = TILE[0] / 1920
+FONT_PATHS = ["/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf",
+              "/System/Library/Fonts/Helvetica.ttc", "C:/Windows/Fonts/arial.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+LEVEL_RU = {"multi": "несколько камер", "multi_partial": "несколько камер, часть рёбер закрыта",
+            "single": "одна камера", "road": "только дорога/гомография", "predicted": "только прогноз",
+            "lost": "потерян", "initializing": "инициализация"}
+
+
+def font(size):
+    for p in FONT_PATHS:
+        if Path(p).exists():
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+
+class Reader(threading.Thread):
+    """Декодирование видео камеры в отдельном потоке (кадры сразу уменьшаются до плитки)."""
+
+    def __init__(self, path: Path):
+        super().__init__(daemon=True)
+        self.cap = cv2.VideoCapture(str(path))
+        self.q: queue.Queue = queue.Queue(maxsize=8)
+
+    def run(self):
+        while True:
+            ok, img = self.cap.read()
+            self.q.put(cv2.resize(img, TILE, interpolation=cv2.INTER_AREA) if ok else None)
+            if not ok:
+                return
+
+
+def project(cam, pts):
+    uv = cam.project(np.atleast_2d(pts)) * SCALE
+    return uv
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data", type=Path, default=Path("tmp/project2"))
+    p.add_argument("--detections", type=Path, default=Path("outputs/main/detections"))
+    p.add_argument("--config", default="configs/upgrade_recommended.json", help="JSON конфигурации или none (вариант A)")
+    p.add_argument("--speed", type=float, default=1.0, help="темп воспроизведения (1 — реальный)")
+    p.add_argument("--save", type=Path, default=None)
+    p.add_argument("--no-window", action="store_true")
+    p.add_argument("--start-snapshot", type=int, default=None, help="сохранить кадр с этим номером в PNG и выйти")
+    args = p.parse_args(argv)
+    import os
+    os.chdir(Path(__file__).resolve().parents[1])              # пути по умолчанию — от корня репозитория
+
+    if args.config.lower() == "none":
+        cfg = StreamConfig()
+        for dotted, value in VARIANTS["A"][1].items():
+            s, k = dotted.split(".")
+            setattr(getattr(cfg, s), k, value)
+        name = "A (базовый)"
+    else:
+        cfg = StreamConfig.load(Path(args.config))
+        name = "REC (курс по силуэту, дорога, неопределённость)"
+    cams_ids = cfg.cameras.ids
+    model = load_truck_model(cfg)
+    tracker, _, _, dims = build_components(cfg, model)
+    table, n = load_detections_table(args.detections, cams_ids)
+    polys = load_polygons(args.detections, cams_ids)
+    try:
+        target = load_target(args.data)
+    except Exception:                                    # noqa: BLE001
+        target = None
+    readers = {c: Reader(args.data / cfg.cameras.video_pattern.format(cam=c)) for c in cams_ids}
+    for r in readers.values():
+        r.start()
+
+    # масштаб — по траектории (эталон только задаёт рамку картинки); камеры за рамкой не рисуются
+    if target is not None:
+        pts = np.array(target.positions[target.valid][:, :2])
+    else:
+        pts = np.array([make_camera(args.data, c, 0).position[:2] for c in cams_ids])
+    lo, hi = pts.min(0), pts.max(0)
+    pad = 0.08 * (hi - lo)
+    lo, hi = lo - pad, hi + pad
+    MAP = (1920, 360)
+    k = min(MAP[0] / (hi[0] - lo[0]), MAP[1] / (hi[1] - lo[1]))
+
+    def to_map(xy):
+        xy = np.atleast_2d(xy)
+        return np.c_[(xy[:, 0] - lo[0]) * k + (MAP[0] - (hi[0] - lo[0]) * k) / 2,
+                     MAP[1] - ((xy[:, 1] - lo[1]) * k + (MAP[1] - (hi[1] - lo[1]) * k) / 2)]
+
+    f_big, f_mid, f_small = font(26), font(20), font(16)
+    trail = deque(maxlen=90)
+    est_path, gt_path = [], []
+    writer = None
+    if args.save:
+        args.save.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(args.save), cv2.VideoWriter_fourcc(*"mp4v"), cfg.cameras.fps, (1920, 1080))
+    if not args.no_window:
+        cv2.namedWindow("Peleng: 5 камер, реальное время", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Peleng: 5 камер, реальное время", 1600, 900)
+    period = 1.0 / (cfg.cameras.fps * args.speed)
+    t_next = time.perf_counter()
+    fps_hist = deque(maxlen=30)
+    paused = False
+    m = cfg.detector.edge_margin_px
+    for f in range(n):
+        frames = {c: readers[c].q.get() for c in cams_ids}
+        if any(v is None for v in frames.values()):
+            break
+        cams = {c: make_camera(args.data, c, f + cfg.cameras.frame_offset) for c in cams_ids}
+        dets, tuples = {}, []
+        for c in cams_ids:
+            d = table[c].get(f)
+            if d is None:
+                continue
+            dets[c] = d
+            valid = np.array([d.x1 > m, d.x2 < cfg.cameras.width - m, d.y1 > m, d.y2 < cfg.cameras.height - m])
+            tuples.append((c, np.array([d.x1, d.x2, d.y1, d.y2]), valid, d.confidence, (d.point_u, d.point_v),
+                           not d.unreliable, polys.get((c, f)) if cfg.orientation.enabled else None))
+        t0 = time.perf_counter()
+        est = tracker.step(f, {c: cams[c] for c, *_ in tuples}, tuples, dt_frames=1.0)
+        tick_ms = (time.perf_counter() - t0) * 1000
+        ok = np.all(np.isfinite(est.position))
+        gt = target.position(f + cfg.cameras.frame_offset) if target is not None else np.full(3, np.nan)
+        if ok:
+            trail.append(est.position.copy())
+            est_path.append(est.position[:2].copy())
+        if np.all(np.isfinite(gt)):
+            gt_path.append(gt[:2].copy())
+        sil = silhouette_points(est.box_center, tracker.heading_dir, model, dims.as_array()) if ok else None
+
+        canvas = np.zeros((1080, 1920, 3), np.uint8)
+        slots = [(0, 0), (640, 0), (1280, 0), (0, 360), (640, 360)]
+        for (x0, y0), c in zip(slots, cams_ids):
+            img = frames[c].copy()
+            cam = cams[c]
+            if c in dets:
+                d = dets[c]
+                poly = polys.get((c, f))
+                if poly is not None:
+                    cv2.polylines(img, [(poly * SCALE).astype(np.int32)], True, (90, 220, 90), 1, cv2.LINE_AA)
+                rejected = c in est.rejected_cameras
+                col = (60, 60, 230) if rejected else (200, 200, 200)
+                cv2.rectangle(img, (int(d.x1 * SCALE), int(d.y1 * SCALE)), (int(d.x2 * SCALE), int(d.y2 * SCALE)),
+                              col, 1, cv2.LINE_AA)
+            if ok:
+                uv = project(cam, sil)
+                if np.all(np.isfinite(uv)):
+                    hull = cv2.convexHull(uv.astype(np.float32)).astype(np.int32)
+                    over = img.copy()
+                    cv2.fillConvexPoly(over, hull, (230, 140, 40))
+                    img = cv2.addWeighted(over, 0.25, img, 0.75, 0)
+                    cv2.polylines(img, [hull], True, (255, 170, 60), 2, cv2.LINE_AA)
+                tr = project(cam, np.array(trail))
+                tr = tr[np.all(np.isfinite(tr), axis=1)].astype(np.int32)
+                if len(tr) > 1:
+                    cv2.polylines(img, [tr], False, (0, 220, 255), 2, cv2.LINE_AA)
+                for pt, colr in ((est.cab_center, (60, 60, 255)), (est.position, (0, 230, 255))):
+                    q = project(cam, pt)[0]
+                    if np.all(np.isfinite(q)):
+                        cv2.circle(img, tuple(q.astype(int)), 5, colr, -1, cv2.LINE_AA)
+            if np.all(np.isfinite(gt)):
+                q = project(cam, gt)[0]
+                if np.all(np.isfinite(q)) and 0 <= q[0] < TILE[0] and 0 <= q[1] < TILE[1]:
+                    cv2.drawMarker(img, tuple(q.astype(int)), (255, 255, 255), cv2.MARKER_CROSS, 14, 2)
+            canvas[y0:y0 + 360, x0:x0 + 640] = img
+            cv2.rectangle(canvas, (x0, y0), (x0 + 639, y0 + 359), (40, 40, 40), 1)
+
+        # вид сверху
+        mp = canvas[720:1080]
+        mp[:] = (24, 24, 28)
+        for c in cams_ids:
+            q = to_map(cams[c].position[:2])[0].astype(int)
+            fwd = cams[c].forward[:2] / max(np.linalg.norm(cams[c].forward[:2]), 1e-9)
+            cv2.circle(mp, tuple(q), 6, (180, 180, 180), -1)
+            cv2.line(mp, tuple(q), tuple((q + fwd * [1, -1] * 30).astype(int)), (180, 180, 180), 2)
+            cv2.putText(mp, str(c), tuple(q + [8, -8]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        if len(gt_path) > 1:
+            cv2.polylines(mp, [to_map(np.array(gt_path)).astype(np.int32)], False, (150, 150, 150), 2, cv2.LINE_AA)
+        if len(est_path) > 1:
+            cv2.polylines(mp, [to_map(np.array(est_path)).astype(np.int32)], False, (0, 220, 255), 2, cv2.LINE_AA)
+        if ok:
+            fp = to_map(sil[:, :2])
+            cv2.fillConvexPoly(mp, cv2.convexHull(fp.astype(np.float32)).astype(np.int32), (230, 140, 40))
+            C = est.reference_covariance[:2, :2]
+            if np.all(np.isfinite(C)):
+                w, v = np.linalg.eigh(C)
+                ax = np.sqrt(np.maximum(w, 0) * 5.991) * k
+                ang = -np.degrees(np.arctan2(v[1, 1], v[0, 1]))
+                cv2.ellipse(mp, tuple(to_map(est.position[:2])[0].astype(int)), (int(ax[1]), int(ax[0])), ang, 0, 360,
+                            (120, 220, 120), 1, cv2.LINE_AA)
+            cv2.circle(mp, tuple(to_map(est.position[:2])[0].astype(int)), 4, (0, 230, 255), -1)
+
+        # панель
+        now = time.perf_counter()
+        fps_hist.append(now)
+        fps = (len(fps_hist) - 1) / (fps_hist[-1] - fps_hist[0]) if len(fps_hist) > 2 else float("nan")
+        err = float(np.linalg.norm(est.position - gt) / cfg.cameras.units_per_meter) if ok and np.all(np.isfinite(gt)) else float("nan")
+        pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        dr = ImageDraw.Draw(pil)
+        for (x0, y0), c in zip(slots, cams_ids):
+            used = c in dets and c not in est.rejected_cameras
+            tag = "детекция" if used else ("отклонена" if c in dets else "нет детекции")
+            dr.rectangle([x0 + 6, y0 + 6, x0 + 210, y0 + 32], fill=(0, 0, 0))
+            dr.text((x0 + 12, y0 + 9), f"Cam{c} · {tag}", font=f_small,
+                    fill=(120, 230, 120) if used else (240, 120, 120) if c in dets else (170, 170, 170))
+        px, py = 1280 + 18, 360 + 12
+        upm = cfg.cameras.units_per_meter
+        ref_r = np.sqrt(np.trace(est.reference_covariance[:2, :2]) * 5.991 / 2) / upm if ok else float("nan")
+        lines = [
+            (f"Кадр {f} / {n - 1}   t = {f / cfg.cameras.fps:5.2f} с", f_big, (255, 255, 255)),
+            (name, f_small, (160, 200, 255)),
+            (f"Наблюдение: {LEVEL_RU.get(est.observation_level, est.observation_level)}", f_mid, (230, 230, 230)),
+            (f"Камер с детекцией: {est.cameras}, в обновлении: {est.cameras_used}", f_mid, (230, 230, 230)),
+            (f"Скорость: {est.speed_mps * 3.6:5.1f} км/ч   курс: {np.degrees(est.heading):6.1f}°" if ok else "Скорость: —",
+             f_mid, (230, 230, 230)),
+            (f"Неопределённость: 95 % в радиусе ~{ref_r:4.1f} м, курс ±{np.degrees(est.heading_std):4.1f}°" if ok else "",
+             f_mid, (120, 220, 120)),
+            (f"Ошибка против эталона CSV: {err:5.2f} м" if np.isfinite(err) else "Ошибка: —", f_mid, (255, 220, 120)),
+            (f"Трекер: {tick_ms:4.1f} мс/кадр   показ: {fps:4.1f} FPS", f_mid, (230, 230, 230)),
+            ("Детекции YOLO посчитаны заранее; трекер видит только прошлое", f_small, (170, 170, 170)),
+            ("Синий — модель по оценке, жёлтый — точка CSV и след, красный — центр", f_small, (170, 170, 170)),
+            ("кабины, белый крест — эталон (только для сравнения), зелёный — маска", f_small, (170, 170, 170)),
+        ]
+        for text, fnt, col in lines:
+            dr.text((px, py), text, font=fnt, fill=col)
+            py += fnt.size + 9
+        dr.text((12, 728), "Вид сверху: серая — эталон CSV, жёлтая — оценка, эллипс — 95 % неопределённости",
+                font=f_small, fill=(200, 200, 200))
+        canvas = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+
+        if args.start_snapshot is not None and f == args.start_snapshot:
+            cv2.imwrite("outputs/demo_snapshot.png", canvas)
+            break
+        if writer is not None:
+            writer.write(canvas)
+        if not args.no_window:
+            cv2.imshow("Peleng: 5 камер, реальное время", canvas)
+            t_next += period
+            wait = max(1, int((t_next - time.perf_counter()) * 1000))
+            key = cv2.waitKey(wait) & 0xFF
+            if time.perf_counter() > t_next + 0.5:
+                t_next = time.perf_counter()               # отстали — не догоняем, темп от текущего момента
+            if key == ord(" "):
+                paused = True
+            while paused:
+                key = cv2.waitKey(50) & 0xFF
+                if key in (ord(" "), ord("q"), 27):
+                    paused = False
+                    t_next = time.perf_counter()
+            if key in (ord("q"), 27):
+                break
+    if writer is not None:
+        writer.release()
+        print(f"записано: {args.save}")
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
