@@ -30,6 +30,9 @@ def detections_dir(out: Path) -> Path:
 
 
 def run_detection(args) -> None:
+    if getattr(args, "detector", "yolo") == "classic":
+        run_classic_detection(args)
+        return
     # ultralytics импортируется только здесь: остальные шаги работают по сохранённым детекциям без него
     from detection.yolo import WeightsNotFoundError, YoloDetector, YoloSettings
 
@@ -71,6 +74,80 @@ def run_detection(args) -> None:
         "weights": str(args.weights), "imgsz": args.imgsz, "conf": args.conf,
         "device": detector.device, "classes": detector.model.names,
     }, ensure_ascii=False, indent=2))
+
+
+def _save_camera(out: Path, cam: int, results) -> int:
+    rows, polygons = [], {}
+    for res in results:
+        if res.detection is None:
+            continue
+        rows.append(res.detection.to_row())
+        if res.polygon is not None and len(res.polygon):
+            polygons[str(res.detection.frame)] = res.polygon
+    with open(out / f"cam{cam}.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=Detection.columns())
+        writer.writeheader()
+        writer.writerows(rows)
+    np.savez_compressed(out / f"cam{cam}_polygons.npz", **polygons)
+    return len(rows)
+
+
+def camera_rotations(data_dir: Path, cam: int, frame_offset: int = 0) -> tuple[np.ndarray, list | None]:
+    """K полного кадра и повороты мир→камера по кадрам видео (None — камера не поворачивается)."""
+    from reconstruction.camera import load_camera_poses
+    from reconstruction.data_io import camera_csv_path, make_camera
+
+    camera = make_camera(data_dir, cam, frame_offset)
+    poses = load_camera_poses(str(camera_csv_path(data_dir, cam)))
+    angles = {f: p[1:] for f, p in poses.items()}
+    if len({tuple(a) for a in angles.values()}) <= 1:
+        return camera.K, None
+    rotations, last = [], camera.R
+    for frame in range(max(poses) - frame_offset + 1):
+        a = angles.get(frame + frame_offset)
+        if a is not None:
+            camera.update_rotation(*a)
+            last = camera.R.copy()
+        rotations.append(last)
+    return camera.K, rotations
+
+
+def run_classic_detection(args) -> None:
+    """Детекции без нейросети: вычитание фона с учётом известного поворота камеры."""
+    from detection.classic import ClassicDetector, ClassicSettings
+
+    settings = ClassicSettings(min_mask_area_px=args.min_mask_area)
+    detector = ClassicDetector(settings)
+    out = detections_dir(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    for cam in CAMERAS:
+        if (out / f"cam{cam}.csv").exists() and not args.redetect:
+            log.info("cam%d: детекции уже есть, пропускаю; --redetect чтобы пересчитать", cam)
+            continue
+        started = time.time()
+        K, rotations = camera_rotations(args.data, cam, args.frame_offset)
+        n = _save_camera(out, cam, detector.detect_video(video_path(args.data, cam), cam, rotations, K))
+        log.info("cam%d: %d кадров с детекцией за %.0f с (без нейросети%s)", cam, n, time.time() - started,
+                 ", с компенсацией поворота" if rotations is not None else "")
+    (out / "meta.json").write_text(json.dumps({
+        "detector": "classic (вычитание фона, detection/classic.py)",
+        "settings": {k: v for k, v in vars(settings).items()},
+    }, ensure_ascii=False, indent=2, default=list))
+
+
+def detector_info(out: Path) -> dict:
+    """Чем получены детекции (из meta.json): для подписей в отчётах и видео."""
+    try:
+        meta = json.loads((detections_dir(out) / "meta.json").read_text())
+    except (OSError, ValueError):
+        meta = {}
+    if str(meta.get("detector", "")).startswith("classic"):
+        return {"name": "classic", "source": "детектор без нейросети (вычитание фона)",
+                "note": "без нейросети (вычитание фона)", "note_en": "no neural net (background subtraction)",
+                "warning": "Детекции без нейросети (вычитание фона); параметры детектора подобраны на этих же видео."}
+    return {"name": "yolo", "source": f"веса `{meta.get('weights', '?')}`",
+            "note": "YOLO обучена на этих же видео", "note_en": "YOLO trained on these videos",
+            "warning": "Модель дообучена на этих же видео: точность детекции оценена на обучающих данных."}
 
 
 def load_detections(out: Path) -> dict[int, dict[int, Detection]]:

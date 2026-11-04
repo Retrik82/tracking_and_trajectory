@@ -36,7 +36,7 @@ from pipeline.center import (
     _style, debiased_norm, find_gaps, run_evaluation, set_cameras, stats, truck_frame_components,
 )
 from pipeline.coverage import plot_camera_coverage
-from pipeline.detect import load_detections, run_detection
+from pipeline.detect import detector_info, load_detections, run_detection
 from reconstruction.approximation import causal_polynomial, global_polynomial
 from reconstruction.bspline import BSplineTrajectory, fit_initial_bspline
 from reconstruction.cab_model import (
@@ -93,6 +93,8 @@ def build_main_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("detect")
     g.add_argument("--redetect", action="store_true", help="пересчитать детекции, даже если они сохранены")
+    g.add_argument("--detector", choices=["yolo", "classic"], default="yolo",
+                   help="yolo — нейросеть; classic — вычитание фона без нейросети (detection/classic.py)")
     g.add_argument("--imgsz", type=int, default=960)
     g.add_argument("--conf", type=float, default=0.25)
     g.add_argument("--device", default=None, help="mps / cuda / cpu; по умолчанию — автоматически")
@@ -151,6 +153,7 @@ def camera_provider(args):
 def step_center(args, detections) -> dict:
     center_args = copy.copy(args)
     center_args.out = args.out / "center"
+    center_args.detector_info = detector_info(args.out)
     result = run_evaluation(center_args, detections)
     np.savez(args.out / "center_spline.npz", knots=result["spline"].knots,
              control_points=result["spline"].control_points)
@@ -410,7 +413,7 @@ def evaluate_methods(args, detections, center_result, optimized, cab, realtime, 
 def plot_comparison(out: Path, c: dict, cab: dict, args) -> None:
     plt = _style()
     upm, frames = args.units_per_meter, c["frames"]
-    note = "YOLO обучена на этих же видео"
+    note = detector_info(args.out)["note"]
 
     fig, ax = plt.subplots(figsize=(12, 5))
     for name in ("center", "optimized", "cab_center", "approx_rt", "realtime"):
@@ -612,7 +615,8 @@ def write_report(args, metrics: dict, cab: dict, c: dict) -> None:
         "Варианты с пометкой «Офлайн» обрабатывают весь видеоряд сразу (заглядывают вперёд) и приведены "
         "только для сравнения.",
         "",
-        f"Основной результат — **{METHOD_NAMES[MAIN_METHOD]}**. Веса: `{args.weights}`, смещение кадров: {args.frame_offset}.",
+        f"Основной результат — **{METHOD_NAMES[MAIN_METHOD]}**. Детекции: {detector_info(args.out)['source']}, "
+        f"смещение кадров: {args.frame_offset}.",
         "",
         "Испорченные ячейки CSV цели (исключены из оценки): " + ("; ".join(c["target_issues"]) or "нет"),
         "",
@@ -776,6 +780,7 @@ _BOX_EDGES = [(a, b) for a in range(8) for b in range(a + 1, 8) if bin(a ^ b).co
 
 
 def render_videos(args, detections, c: dict) -> None:
+    video_note = detector_info(args.out)["note_en"]
     """Видео по трекеру реального времени: на кадре t рисуется только то, что известно к кадру t."""
     import cv2
 
@@ -856,7 +861,7 @@ def render_videos(args, detections, c: dict) -> None:
                     lines.append(f"error vs target {err[f]:.2f} m")
             else:
                 lines.append("initializing")
-            lines.append("YOLO trained on these videos")
+            lines.append(video_note)
             cv2.rectangle(img, (10, 10), (560, 20 + 30 * len(lines)), (20, 20, 20), -1)
             for i, text in enumerate(lines):
                 color = bgr(ORANGE) if text.startswith(("PREDICTED", "PARTIAL")) else (255, 255, 255)
