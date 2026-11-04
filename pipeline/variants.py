@@ -25,7 +25,7 @@ import numpy as np
 
 from pipeline.center import _style, find_gaps, stats
 from pipeline.config import StreamConfig
-from pipeline.streaming import StreamPipeline, load_detections_table, load_truck_model
+from pipeline.streaming import StreamPipeline, load_detections_table, load_polygons, load_truck_model
 from reconstruction.bspline import fit_initial_bspline
 from reconstruction.cab_model import truck_axes
 from reconstruction.data_io import load_target
@@ -45,7 +45,35 @@ VARIANTS = {
     "E": ("D + адаптивный выбор камер",
           {"scheduler.enabled": True, "triangulation.mode": "model_corrected", "spline.enabled": True}),
 }
+# Доработка: независимые компоненты поверх A (ablation) и комбинированный вариант
+_A = VARIANTS["A"][1]
+UPGRADE_COMPONENTS = {
+    # курс по силуэту объединяется с курсом трека по дисперсиям — нужна честная дисперсия курса трека
+    "O": ("визуальная ориентация (силуэт модели против маски)",
+          {"orientation.enabled": True, "uncertainty.heading_sigma_floor_deg": 5.0,
+           "uncertainty.heading_turn_lag_s": 1.0}),
+    "H": ("гомография дороги (точка основания -> x, y), дорога online",
+          {"homography.enabled": True, "road.mode": "online"}),
+    "R": ("дорожная плоскость online + ограничение основания", {"road.mode": "online", "road.constraint": True}),
+    "M": ("дальность по габаритам модели", {"mono_depth.enabled": True}),
+    "V": ("строгое многокамерное подтверждение + проверка передачи между камерами",
+          {"confirmation.init_min_ray_angle_deg": 10.0, "confirmation.init_max_reproj_px": 40.0,
+           "confirmation.handoff_gate_chi2": 13.8}),
+    "U": ("модель неопределённости: коррекция после пределов, рост без стерео, систематика модели и курса",
+          {"uncertainty.clip_covariance": True, "uncertainty.no_stereo_q_growth_per_s": 0.5,
+           "uncertainty.depth_sigma_growth_mps": 1.0, "uncertainty.model_sigma_px": 5.0,
+           "uncertainty.heading_sigma_floor_deg": 5.0, "uncertainty.heading_turn_lag_s": 1.0,
+           "uncertainty.model_length_sigma_m": 0.6}),
+}
+for _k, (_name, _over) in UPGRADE_COMPONENTS.items():
+    VARIANTS[f"A+{_k}"] = (f"A + {_name}", {**_A, **_over})
+VARIANTS["ALL"] = ("A + все доработки", {**_A, **{k: v for _, o in UPGRADE_COMPONENTS.values() for k, v in o.items()}})
+# Рекомендуемая: все, кроме дальности по габаритам (на реальном видео нейтральна, в сценарии потери стерео
+# немного ухудшает — избыточна при рёбрах рамки той же камеры; см. docs/UPGRADE_REPORT.md)
+VARIANTS["REC"] = ("A + рекомендуемые доработки (O, H, R, V, U; без M)",
+                   {**_A, **{k: v for key, (_, o) in UPGRADE_COMPONENTS.items() if key != "M" for k, v in o.items()}})
 SMOOTHED_VARIANTS = {"D", "E"}
+SEGMENTS = {"одна камера 200–300": (200, 300), "медленный поворот 650–850": (650, 850)}
 
 
 def variant_config(base: StreamConfig, key: str) -> StreamConfig:
@@ -80,6 +108,7 @@ def ground_truth(data_dir: Path, num_frames: int, fps: float, upm: float, frame_
     vel = spline.derivative(1).evaluate(t) * fps / upm
     acc = spline.derivative(2).evaluate(t) * fps ** 2 / upm
     return {"frames": frames, "gt": gt, "valid": valid, "speed": np.linalg.norm(vel, axis=1),
+            "heading": np.arctan2(vel[:, 1], vel[:, 0]),
             "accel": np.linalg.norm(acc, axis=1), "issues": target.issues}
 
 
@@ -167,6 +196,83 @@ def evaluate_records(records, truth: dict, upm: float, fps: float, model, dims: 
     return out
 
 
+def extended_metrics(records, truth: dict, upm: float, pose_provider, test_ranges=None, tracker=None) -> dict:
+    """
+    Доработка: ошибка по глубине (вдоль лучей камер с детекцией) и поперёк, по горизонтали и вертикали,
+    ошибка курса (против направления скорости CSV цели, где скорость > 2 м/с), калибровка заявленной
+    неопределённости (|e|/σ, доля в 1σ и 95 % эллипсах по горизонтали), NIS, доля отклонённых детекций,
+    уровни наблюдения, ошибки на участках (одна камера, медленный поворот), число инициализаций.
+    """
+    n = len(truth["frames"])
+    gt, valid = truth["gt"], truth["valid"]
+    sel = np.ones(n, bool)
+    if test_ranges:
+        sel[:] = False
+        for a, b in test_ranges:
+            sel[a:b + 1] = True
+    depth_e, cross_e, horiz_e, vert_e, head_e, ratio, d2_list, sig = [], [], [], [], [], [], [], []
+    levels: dict[str, int] = {}
+    seg_err = {k: [] for k in SEGMENTS}
+    nis_point, nis_aux = [], []
+    det_total = rej_total = aux_rej = 0
+    clip_frames = 0
+    for r in records:
+        i = r.index
+        if i >= n:
+            continue
+        levels[r.observation_level] = levels.get(r.observation_level, 0) + 1
+        det_total += r.cameras_detected
+        rej_total += len(r.rejected_cameras)
+        aux_rej += r.aux_rejected
+        nis_aux += [x for x in r.aux_nis if np.isfinite(x)]
+        if np.isfinite(r.point_nis):
+            nis_point.append(r.point_nis)
+        clip_frames += int(r.clip_correction_m > 1e-6)
+        if not (valid[i] and sel[i] and np.all(np.isfinite(r.reference))):
+            continue
+        e = (r.reference - gt[i]) / upm
+        horiz_e.append(float(np.linalg.norm(e[:2])))
+        vert_e.append(float(abs(e[2])))
+        for name, (a, b) in SEGMENTS.items():
+            if a <= i <= b:
+                seg_err[name].append(float(np.linalg.norm(e)))
+        cams = r.detected_cameras or r.active_cameras
+        if cams:
+            rays = []
+            for c in cams:
+                ray = gt[i] - pose_provider(c, i).position
+                rays.append(ray / max(np.linalg.norm(ray), 1e-9))
+            along = float(np.mean([abs(e @ u) for u in rays]))
+            depth_e.append(along)
+            cross_e.append(float(np.sqrt(max(e @ e - along ** 2, 0.0))))
+        if truth["speed"][i] > 2.0 and np.isfinite(r.heading_deg):
+            head_e.append(abs(float((r.heading_deg - np.degrees(truth["heading"][i]) + 180) % 360 - 180)))
+        C = r.reference_cov_m2[:2, :2]
+        if np.all(np.isfinite(C)) and np.linalg.det(C) > 0:
+            d2 = float(e[:2] @ np.linalg.solve(C, e[:2]))
+            d2_list.append(d2)
+            sigma = float(np.sqrt(np.trace(C) / 2))
+            sig.append(sigma)
+            ratio.append(float(np.linalg.norm(e[:2]) / np.sqrt(2) / sigma))
+    d2 = np.array(d2_list)
+    out = {
+        "depth_error_m": stats(np.array(depth_e)), "cross_depth_error_m": stats(np.array(cross_e)),
+        "horizontal_error_m": stats(np.array(horiz_e)), "vertical_error_m": stats(np.array(vert_e)),
+        "heading_error_deg": stats(np.array(head_e)),
+        "sigma_m": stats(np.array(sig)), "error_to_sigma": stats(np.array(ratio)),
+        "coverage_1sigma": float(np.mean(d2 <= 1.0)) if len(d2) else float("nan"),   # идеал 0.393 (χ², 2 ст.)
+        "coverage_95": float(np.mean(d2 <= 5.991)) if len(d2) else float("nan"),     # идеал 0.95
+        "nis_point": stats(np.array(nis_point)), "nis_aux": stats(np.array(nis_aux)),
+        "rejected_detection_fraction": rej_total / max(det_total, 1),
+        "aux_rejected": aux_rej, "clip_frames": clip_frames,
+        "observation_levels": levels,
+        "segments_m": {k: stats(np.array(v)) for k, v in seg_err.items()},
+        "initializations": getattr(tracker, "initializations", float("nan")),
+        "init_rejected": getattr(tracker, "init_rejected", float("nan")),
+    }
+    return out
+
+
 def run_variants(base: StreamConfig, data_dir: Path, det_dir: Path, out_dir: Path, keys: list[str],
                  num_frames: int | None = None, test_ranges=None, source_delays=None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -175,12 +281,15 @@ def run_variants(base: StreamConfig, data_dir: Path, det_dir: Path, out_dir: Pat
     c = base.cameras
     truth = ground_truth(data_dir, n, c.fps, c.units_per_meter, c.frame_offset)
     model = load_truck_model(base)
+    polygons = None
     results = {}
     for key in keys:
         cfg = variant_config(base, key)
         started = time.time()
+        if cfg.orientation.enabled and polygons is None:
+            polygons = load_polygons(det_dir, base.cameras.ids)
         pipe = StreamPipeline(cfg, data_dir, out_dir / f"variant_{key}", detections, n, model=model,
-                              source_delays=source_delays)
+                              source_delays=source_delays, polygons=polygons if cfg.orientation.enabled else None)
         records = pipe.run()
         dims = pipe.dims.as_array()
         m = evaluate_records(records, truth, c.units_per_meter, c.fps, model, dims, key in SMOOTHED_VARIANTS, test_ranges)
@@ -188,6 +297,8 @@ def run_variants(base: StreamConfig, data_dir: Path, det_dir: Path, out_dir: Pat
             m["realtime_track"] = {k: v for k, v in evaluate_records(records, truth, c.units_per_meter, c.fps, model,
                                                                      dims, False, test_ranges).items()
                                    if k != "error_series"}
+        m["extended"] = extended_metrics(records, truth, c.units_per_meter, pipe.pose_provider, test_ranges,
+                                         pipe.tracker)
         perf = pipe.performance()
         m["performance"] = {"updates_per_s": perf["updates_per_s"], "latency_ms": perf["latency_ms"],
                             "mean_active_cameras": perf["mean_active_cameras"],
@@ -244,6 +355,36 @@ def write_report(out_dir: Path, results: dict, truth: dict, cfg: StreamConfig, t
         lines.append(f"| {k} | {_f(p['updates_per_s'], 1)} | {_f(p['latency_ms']['p50'], 1)} / {_f(p['latency_ms']['p95'], 1)} | "
                      f"{_f(p['tick_ms_p50'])} / {_f(p['tick_ms_p95'])} | {_f(p['mean_active_cameras'])} | "
                      f"{_f(p['detections_per_tick'])} | {_f(p['detection_fraction'])} |")
+    lines += ["", "## Доработка: глубина, курс, калибровка неопределённости", "",
+              "Глубина — вдоль лучей камер с детекцией (среднее по камерам), «поперёк» — остальное. Калибровка: "
+              "|e|/σ по горизонтали (идеал ≈ 0.8–1), доля ошибок внутри 1σ- и 95 %-эллипса (идеал 39 % и 95 %).", "",
+              "| вариант | глубина, медиана / p95 | поперёк, медиана / p95 | горизонт. / вертик., медиана "
+              "| курс, медиана / p95, ° | σ, медиана, м | |e|/σ, медиана / p95 | в 1σ / в 95 % | NIS точки / доп., медиана "
+              "| отклонено детекций | доп. измерений отклонено | инициализаций | кадров с поправкой пределов |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for k, m in results.items():
+        x = m.get("extended")
+        if not x:
+            continue
+        lines.append(
+            f"| {k} | {_f(x['depth_error_m'].get('median'))} / {_f(x['depth_error_m'].get('p95'))} | "
+            f"{_f(x['cross_depth_error_m'].get('median'))} / {_f(x['cross_depth_error_m'].get('p95'))} | "
+            f"{_f(x['horizontal_error_m'].get('median'))} / {_f(x['vertical_error_m'].get('median'))} | "
+            f"{_f(x['heading_error_deg'].get('median'), 1)} / {_f(x['heading_error_deg'].get('p95'), 1)} | "
+            f"{_f(x['sigma_m'].get('median'))} | {_f(x['error_to_sigma'].get('median'))} / {_f(x['error_to_sigma'].get('p95'))} | "
+            f"{x['coverage_1sigma'] * 100:.0f} % / {x['coverage_95'] * 100:.0f} % | "
+            f"{_f(x['nis_point'].get('median'))} / {_f(x['nis_aux'].get('median'))} | "
+            f"{x['rejected_detection_fraction'] * 100:.1f} % | {x['aux_rejected']} | {x['initializations']} | {x['clip_frames']} |")
+    lines += ["", "### Участки", "", "| вариант | " + " | ".join(f"{name}: медиана / p95 / макс" for name in SEGMENTS) +
+              " | уровни наблюдения |", "|---|" + "---|" * len(SEGMENTS) + "---|"]
+    for k, m in results.items():
+        x = m.get("extended")
+        if not x:
+            continue
+        segs = " | ".join(f"{_f(x['segments_m'][name].get('median'))} / {_f(x['segments_m'][name].get('p95'))} / "
+                          f"{_f(x['segments_m'][name].get('max'))}" for name in SEGMENTS)
+        lv = ", ".join(f"{a}: {b}" for a, b in sorted(x["observation_levels"].items()))
+        lines.append(f"| {k} | {segs} | {lv} |")
     for k, m in results.items():
         if "realtime_track" in m:
             r = m["realtime_track"]["error_3d_m"]
